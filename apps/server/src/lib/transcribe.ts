@@ -1,115 +1,80 @@
-import OpenAI from "openai";
+import Groq from "groq-sdk";
 
-let _client: OpenAI | null = null;
+let _client: Groq | null = null;
 
-function getClient(): OpenAI {
+function getClient(): Groq {
   if (!_client) {
-    _client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY ?? "" });
+    _client = new Groq({ apiKey: process.env.GROQ_API_KEY ?? "" });
   }
   return _client;
-}
-
-export interface SpeakerSegment {
-  speakerTag: number;
-  text: string;
-  startTimeMs: number;
-  endTimeMs: number;
-  languageCode: string;
-  confidence: number;
-  words: Array<{ word: string; startMs: number; endMs: number; confidence: number }>;
 }
 
 export interface TranscriptionResult {
   fullText: string;
   languageCode: string;
   confidence: number;
-  speakers: SpeakerSegment[];
+}
+
+// Queue to limit concurrent transcriptions (Groq rate limits)
+const MAX_CONCURRENT = 2;
+let activeCount = 0;
+const pendingQueue: Array<() => void> = [];
+
+function acquireSlot(): Promise<void> {
+  if (activeCount < MAX_CONCURRENT) {
+    activeCount++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    pendingQueue.push(() => {
+      activeCount++;
+      resolve();
+    });
+  });
+}
+
+function releaseSlot(): void {
+  activeCount--;
+  const next = pendingQueue.shift();
+  if (next) next();
 }
 
 /**
- * Transcribe a WAV audio chunk using OpenAI Whisper.
- * Supports multi-language detection automatically.
- *
- * @param audioBuffer - WAV audio data as Buffer
- * @param participantName - Name of the speaker (from session participant)
- * @param languageHint - Optional language hint (e.g. "en", "hi", "es")
+ * Transcribe a WAV audio chunk using Groq Whisper (free).
+ * Model: whisper-large-v3-turbo
  */
 export async function transcribeChunk(
   audioBuffer: Buffer,
-  _participantName: string = "Speaker",
-  languageHint?: string,
+  language: string = "en",
 ): Promise<TranscriptionResult> {
-  const client = getClient();
+  await acquireSlot();
 
-  // Create a File object from buffer for the API
-  const file = new File(
-    [new Uint8Array(audioBuffer) as unknown as Uint8Array<ArrayBuffer>],
-    "audio.wav",
-    { type: "audio/wav" },
-  );
+  try {
+    const client = getClient();
 
-  const response = await client.audio.transcriptions.create({
-    model: "whisper-1",
-    file,
-    response_format: "verbose_json",
-    timestamp_granularities: ["segment"],
-    ...(languageHint ? { language: languageHint.split("-")[0] } : {}),
-  });
+    // Groq expects a File object
+    const file = new File(
+      [new Uint8Array(audioBuffer) as unknown as Uint8Array<ArrayBuffer>],
+      "audio.wav",
+      { type: "audio/wav" },
+    );
 
-  const fullText = response.text ?? "";
-  const responseAny = response as unknown as Record<string, unknown>;
-  const detectedLanguage = (responseAny.language as string) ?? languageHint ?? "en";
-
-  // Build speaker segments from Whisper segments
-  const segments: SpeakerSegment[] = [];
-  const whisperSegments = responseAny.segments as
-    | Array<{
-        start: number;
-        end: number;
-        text: string;
-        avg_logprob?: number;
-      }>
-    | undefined;
-
-  if (whisperSegments && whisperSegments.length > 0) {
-    for (const seg of whisperSegments) {
-      segments.push({
-        speakerTag: 0,
-        text: seg.text.trim(),
-        startTimeMs: Math.round(seg.start * 1000),
-        endTimeMs: Math.round(seg.end * 1000),
-        languageCode: detectedLanguage,
-        confidence: seg.avg_logprob ? Math.exp(seg.avg_logprob) : 0.9,
-        words: [],
-      });
-    }
-  } else if (fullText) {
-    // Fallback: single segment for entire chunk
-    segments.push({
-      speakerTag: 0,
-      text: fullText,
-      startTimeMs: 0,
-      endTimeMs: 5000,
-      languageCode: detectedLanguage,
-      confidence: 0.9,
-      words: [],
+    const transcription = await client.audio.transcriptions.create({
+      file,
+      model: "whisper-large-v3-turbo",
+      language: language.split("-")[0] ?? "en",
+      response_format: "json",
+      temperature: 0,
     });
+
+    const text = transcription.text ?? "";
+
+    return {
+      fullText: text,
+      languageCode: language,
+      confidence: 0.95,
+    };
+  } finally {
+    releaseSlot();
   }
-
-  return {
-    fullText,
-    languageCode: detectedLanguage,
-    confidence:
-      segments.length > 0
-        ? segments.reduce((s, seg) => s + seg.confidence, 0) / segments.length
-        : 0,
-    speakers: segments,
-  };
-}
-
-/**
- * No longer needed — Vercel Blob uses URLs, not GCS URIs.
- */
-export function gcsUri(_path: string): string {
-  return _path;
 }

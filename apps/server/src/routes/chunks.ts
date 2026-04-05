@@ -1,12 +1,4 @@
-import {
-  chunks,
-  db,
-  participants,
-  recordings,
-  speakerSegments,
-  transcriptions,
-  uploadWal,
-} from "@my-better-t-app/db";
+import { chunks, db, recordings, transcriptions, uploadWal } from "@my-better-t-app/db";
 import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { createHash } from "node:crypto";
@@ -131,26 +123,17 @@ app.post("/upload", async (c) => {
       .where(eq(recordings.id, recordingId));
   }
 
-  // --- TRANSCRIBE SYNCHRONOUSLY (critical for Vercel serverless) ---
+  // --- TRANSCRIBE SYNCHRONOUSLY with Groq Whisper (free) ---
   let transcriptionText: string | null = null;
   let transcriptionError: string | null = null;
 
-  if (chunk && process.env.OPENAI_API_KEY) {
+  if (chunk && process.env.GROQ_API_KEY) {
     try {
-      // Look up participant name
-      let participantName = "Speaker";
-      if (participantId) {
-        const p = await db.query.participants.findFirst({
-          where: eq(participants.id, participantId),
-        });
-        if (p?.name) participantName = p.name;
-      }
-
-      const primaryLang = recording.languageCodes?.[0] ?? "en-US";
-      const result = await transcribeChunk(buffer, participantName, primaryLang);
+      const primaryLang = recording.languageCodes?.[0] ?? "en";
+      const result = await transcribeChunk(buffer, primaryLang);
 
       // Save transcription record
-      const [txn] = await db
+      await db
         .insert(transcriptions)
         .values({
           chunkId: chunk.id,
@@ -162,28 +145,7 @@ app.post("/upload", async (c) => {
           confidence: result.confidence,
           completedAt: new Date(),
         })
-        .returning();
-
-      // Save speaker segments
-      if (txn && result.speakers.length > 0) {
-        const audioStartMs = audioTs?.getTime() ?? null;
-        await db.insert(speakerSegments).values(
-          result.speakers.map((seg) => ({
-            transcriptionId: txn.id,
-            recordingId,
-            participantId,
-            speakerTag: seg.speakerTag,
-            speakerLabel: participantName,
-            text: seg.text,
-            startTimeMs: seg.startTimeMs,
-            endTimeMs: seg.endTimeMs,
-            absoluteStartMs: audioStartMs ? audioStartMs + seg.startTimeMs : null,
-            languageCode: seg.languageCode,
-            confidence: seg.confidence,
-            wordTimings: seg.words,
-          })),
-        );
-      }
+        .onConflictDoNothing();
 
       // Mark WAL transcribed
       await db
@@ -199,15 +161,12 @@ app.post("/upload", async (c) => {
           type: "transcription_ready",
           chunkId: chunk.id,
           participantId,
-          participantName,
           text: result.fullText,
-          languageCode: result.languageCode,
         });
       }
     } catch (err) {
       console.error("Transcription failed:", err);
       transcriptionError = err instanceof Error ? err.message : "Transcription failed";
-      // Save failed transcription record
       if (chunk) {
         await db
           .insert(transcriptions)
