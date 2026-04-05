@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   Check,
   Cloud,
+  CloudOff,
   Download,
   Globe,
   Loader2,
@@ -66,8 +67,8 @@ function formatDuration(seconds: number) {
   return `${seconds.toFixed(1)}s`;
 }
 
-function statusIcon(status: TrackedChunk["uploadStatus"]) {
-  switch (status) {
+function statusIcon(uploadStatus: TrackedChunk["uploadStatus"]) {
+  switch (uploadStatus) {
     case "pending":
       return <Cloud className="size-3 text-muted-foreground" />;
     case "saving":
@@ -183,6 +184,8 @@ export default function RecorderPage() {
   // Transcription state
   const [transcription, setTranscription] = useState<api.TranscriptionResponse | null>(null);
   const [isLoadingTranscript, setIsLoadingTranscript] = useState(false);
+  const [apiError, setApiError] = useState<string | null>(null);
+  const [hasRecorded, setHasRecorded] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const isRecording = status === "recording";
@@ -223,26 +226,42 @@ export default function RecorderPage() {
   const handlePrimary = useCallback(async () => {
     if (isActive) {
       stop();
-      await pipeline.completeSession();
+      // Try to complete session on server (best-effort)
+      pipeline.completeSession().catch(() => {});
       // Final transcript fetch
       if (pipeline.recordingId) {
         setIsLoadingTranscript(true);
-        // Wait a bit for last transcription to process
         setTimeout(async () => {
           try {
             const txn = await api.getTranscriptions(pipeline.recordingId!);
             setTranscription(txn);
+          } catch {
+            // API not available — that's okay
           } finally {
             setIsLoadingTranscript(false);
           }
         }, 3000);
       }
     } else {
+      // ALWAYS start recording immediately — don't let API failures block it
       setTranscription(null);
-      const sessionId = await pipeline.startSession(speakerCount, selectedLanguages);
-      sessionIdRef.current = sessionId;
+      setApiError(null);
+      setHasRecorded(true);
       prevChunkCountRef.current = 0;
       start();
+
+      // Try to create a server session in background (for upload + transcription)
+      try {
+        const sessionId = await pipeline.startSession(speakerCount, selectedLanguages);
+        sessionIdRef.current = sessionId;
+      } catch (err) {
+        sessionIdRef.current = null;
+        setApiError(
+          err instanceof Error
+            ? err.message
+            : "Could not connect to server. Recording locally — transcription unavailable.",
+        );
+      }
     }
   }, [isActive, stop, start, pipeline, speakerCount, selectedLanguages]);
 
@@ -259,8 +278,8 @@ export default function RecorderPage() {
 
   return (
     <div className="container mx-auto flex max-w-2xl flex-col items-center gap-6 px-4 py-8">
-      {/* Recording Config */}
-      {!isActive && !pipeline.recordingId && (
+      {/* Recording Config — shown before first recording */}
+      {!isActive && !hasRecorded && (
         <Card className="w-full">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -326,6 +345,14 @@ export default function RecorderPage() {
         </CardHeader>
 
         <CardContent className="flex flex-col gap-6">
+          {/* API Error Banner */}
+          {apiError && (
+            <div className="flex items-center gap-2 rounded-sm border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-600 dark:text-yellow-400">
+              <CloudOff className="size-4 shrink-0" />
+              <span>{apiError}</span>
+            </div>
+          )}
+
           {/* Waveform */}
           <div className="overflow-hidden rounded-sm border border-border/50 bg-muted/20 text-foreground">
             <LiveWaveform
@@ -466,8 +493,8 @@ export default function RecorderPage() {
         </Card>
       )}
 
-      {/* Live Transcription */}
-      {(transcription || isLoadingTranscript) && (
+      {/* Transcription — always visible once recording has started */}
+      {hasRecorded && (
         <Card className="w-full">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -475,21 +502,29 @@ export default function RecorderPage() {
               Transcription
               {isLoadingTranscript && <Loader2 className="size-4 animate-spin" />}
             </CardTitle>
-            {transcription && (
+            {transcription ? (
               <CardDescription>
                 {transcription.speakers.length} speaker(s) detected —{" "}
                 {transcription.status.completed}/{transcription.status.total} chunks transcribed
                 {transcription.status.processing > 0 &&
                   ` (${transcription.status.processing} processing)`}
               </CardDescription>
+            ) : (
+              <CardDescription>
+                {apiError
+                  ? "Server connection required for transcription"
+                  : isActive
+                    ? "Transcription will appear as chunks are uploaded..."
+                    : "Waiting for transcription results..."}
+              </CardDescription>
             )}
           </CardHeader>
           <CardContent>
             {transcription && transcription.segments.length > 0 ? (
-              <div className="flex flex-col gap-3 rounded-sm border border-border/50 bg-muted/10 p-4">
+              <div className="flex max-h-96 flex-col gap-3 overflow-y-auto rounded-sm border border-border/50 bg-muted/10 p-4">
                 {transcription.segments.map((seg) => (
                   <div key={seg.id} className="flex gap-3">
-                    <div className="flex flex-col items-end">
+                    <div className="flex min-w-[80px] flex-col items-end">
                       <span className={`text-xs font-semibold ${speakerColor(seg.speakerTag)}`}>
                         {seg.speakerLabel ?? `Speaker ${seg.speakerTag}`}
                       </span>
@@ -508,16 +543,31 @@ export default function RecorderPage() {
                   </div>
                 ))}
               </div>
+            ) : apiError ? (
+              <div className="flex flex-col items-center gap-3 py-8 text-sm text-muted-foreground">
+                <CloudOff className="size-8 text-yellow-500/50" />
+                <p className="text-center">
+                  Cannot transcribe without a server connection.
+                  <br />
+                  Audio is still being recorded and saved locally.
+                </p>
+              </div>
             ) : transcription && transcription.status.processing > 0 ? (
               <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
                 <Loader2 className="size-4 animate-spin" />
                 Transcribing audio...
               </div>
-            ) : transcription && transcription.status.total === 0 ? (
+            ) : isActive ? (
+              <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" />
+                Recording... transcript will appear after chunks are processed
+              </div>
+            ) : (
               <p className="py-4 text-center text-sm text-muted-foreground">
-                Waiting for chunks to be uploaded and transcribed...
+                No transcription data yet. Make sure the server is configured with GCS and
+                Speech-to-Text credentials.
               </p>
-            ) : null}
+            )}
           </CardContent>
         </Card>
       )}

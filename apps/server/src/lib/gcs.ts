@@ -34,9 +34,11 @@ export async function chunkExists(gcsPath: string): Promise<boolean> {
 }
 
 export async function getChunkUrl(gcsPath: string): Promise<string> {
-  const [url] = await getBucket().file(gcsPath).getSignedUrl({
-    action: "read",
-    expires: Date.now() + 60 * 60 * 1000,
-  });
+  const [url] = await getBucket()
+    .file(gcsPath)
+    .getSignedUrl({
+      action: "read",
+      expires: Date.now() + 60 * 60 * 1000,
+    });
   return url;
 }

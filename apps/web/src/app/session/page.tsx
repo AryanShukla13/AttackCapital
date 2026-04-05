@@ -183,7 +183,12 @@ export default function SessionPage() {
       pipeline.startFromSession(result.recording.id, result.participant.id, result.session.id);
       setMode("recording");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create session");
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      if (msg.includes("fetch") || msg.includes("network") || msg.includes("500")) {
+        setError("Server is not available. Make sure the database is configured (DATABASE_URL).");
+      } else {
+        setError(msg);
+      }
     } finally {
       setIsLoading(false);
     }
@@ -203,7 +208,12 @@ export default function SessionPage() {
       setSessionParticipants(sess.participants);
       setMode("recording");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to join session");
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      if (msg.includes("fetch") || msg.includes("network") || msg.includes("500")) {
+        setError("Server is not available. Make sure the database is configured.");
+      } else {
+        setError(msg);
+      }
     } finally {
       setIsLoading(false);
     }
