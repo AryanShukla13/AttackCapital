@@ -25,9 +25,7 @@ interface SpeechRecognitionType {
   stop(): void;
   abort(): void;
   onstart: (() => void) | null;
-  onresult:
-    | ((event: { resultIndex: number; results: SpeechRecognitionResultList }) => void)
-    | null;
+  onresult: ((event: { resultIndex: number; results: SpeechRecognitionResultList }) => void) | null;
   onerror: ((event: { error: string }) => void) | null;
   onend: (() => void) | null;
 }
@@ -140,7 +138,9 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
       return;
     }
     if (recognitionRef.current) {
-      try { recognitionRef.current.abort(); } catch {}
+      try {
+        recognitionRef.current.abort();
+      } catch {}
     }
     shouldBeListeningRef.current = true;
     startRecognition();
@@ -149,7 +149,9 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
   const stopListening = useCallback(() => {
     shouldBeListeningRef.current = false;
     if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch {}
+      try {
+        recognitionRef.current.stop();
+      } catch {}
       recognitionRef.current = null;
     }
     setIsListening(false);
@@ -166,7 +168,9 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
     return () => {
       shouldBeListeningRef.current = false;
       if (recognitionRef.current) {
-        try { recognitionRef.current.abort(); } catch {}
+        try {
+          recognitionRef.current.abort();
+        } catch {}
       }
     };
   }, []);
