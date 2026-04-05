@@ -42,6 +42,7 @@ function getSpeechRecognition(): SpeechRecognitionConstructor | null {
 export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) {
   const { language = "en-US", speakerLabel = "You" } = options;
 
+  // Use refs for segments to avoid stale closures in callbacks
   const segmentsRef = useRef<TranscriptSegment[]>([]);
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [interimText, setInterimText] = useState("");
@@ -51,9 +52,11 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
 
   const recognitionRef = useRef<SpeechRecognitionType | null>(null);
   const shouldBeListeningRef = useRef(false);
+  const restartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const languageRef = useRef(language);
   const speakerLabelRef = useRef(speakerLabel);
 
+  // Keep refs in sync
   languageRef.current = language;
   speakerLabelRef.current = speakerLabel;
 
@@ -71,12 +74,12 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
       speakerLabel: speakerLabelRef.current,
     };
     segmentsRef.current = [...segmentsRef.current, segment];
-    setSegments([...segmentsRef.current]);
+    setSegments(segmentsRef.current);
   }, []);
 
-  const startRecognition = useCallback(() => {
+  const createRecognition = useCallback(() => {
     const SpeechRecognitionClass = getSpeechRecognition();
-    if (!SpeechRecognitionClass || !shouldBeListeningRef.current) return;
+    if (!SpeechRecognitionClass) return null;
 
     const recognition = new SpeechRecognitionClass();
     recognition.lang = languageRef.current;
@@ -91,10 +94,12 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
 
     recognition.onresult = (event) => {
       let interim = "";
+
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
         if (!result?.[0]) continue;
         const transcript = result[0].transcript;
+
         if (result.isFinal && transcript.trim()) {
           addSegment(transcript.trim());
           setInterimText("");
@@ -102,34 +107,56 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
           interim += transcript;
         }
       }
-      if (interim) setInterimText(interim);
+
+      if (interim) {
+        setInterimText(interim);
+      }
     };
 
     recognition.onerror = (event) => {
+      // "no-speech" and "aborted" are normal during restarts
       if (event.error === "no-speech" || event.error === "aborted") return;
       if (event.error === "not-allowed") {
-        setError("Microphone access denied.");
+        setError("Microphone access denied. Allow microphone to enable transcription.");
         shouldBeListeningRef.current = false;
+        return;
       }
+      console.error("Speech recognition error:", event.error);
     };
 
     recognition.onend = () => {
       setIsListening(false);
-      // Restart immediately if we should still be listening
+      setInterimText("");
+
+      // CRITICAL: restart immediately to avoid gaps in transcription
+      // Web Speech API stops after ~60s or on silence — we must restart
       if (shouldBeListeningRef.current) {
-        startRecognition();
+        restartTimeoutRef.current = setTimeout(() => {
+          if (shouldBeListeningRef.current) {
+            const newRecognition = createRecognition();
+            if (newRecognition) {
+              recognitionRef.current = newRecognition;
+              try {
+                newRecognition.start();
+              } catch {
+                // retry once more after a short delay
+                setTimeout(() => {
+                  if (shouldBeListeningRef.current) {
+                    try {
+                      newRecognition.start();
+                    } catch {
+                      setError("Speech recognition stopped unexpectedly. Click Record to restart.");
+                    }
+                  }
+                }, 500);
+              }
+            }
+          }
+        }, 50); // 50ms gap — minimal loss
       }
     };
 
-    recognitionRef.current = recognition;
-    try {
-      recognition.start();
-    } catch {
-      // Retry after a tick
-      setTimeout(() => {
-        if (shouldBeListeningRef.current) startRecognition();
-      }, 100);
-    }
+    return recognition;
   }, [addSegment]);
 
   const startListening = useCallback(() => {
@@ -137,21 +164,43 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
       setError("Speech recognition not supported. Use Chrome or Edge.");
       return;
     }
+
+    // Stop existing
     if (recognitionRef.current) {
       try {
         recognitionRef.current.abort();
-      } catch {}
+      } catch {
+        // ignore
+      }
     }
+    if (restartTimeoutRef.current) {
+      clearTimeout(restartTimeoutRef.current);
+    }
+
     shouldBeListeningRef.current = true;
-    startRecognition();
-  }, [startRecognition]);
+    const recognition = createRecognition();
+    if (recognition) {
+      recognitionRef.current = recognition;
+      try {
+        recognition.start();
+      } catch {
+        setError("Failed to start speech recognition.");
+      }
+    }
+  }, [createRecognition]);
 
   const stopListening = useCallback(() => {
     shouldBeListeningRef.current = false;
+    if (restartTimeoutRef.current) {
+      clearTimeout(restartTimeoutRef.current);
+      restartTimeoutRef.current = null;
+    }
     if (recognitionRef.current) {
       try {
         recognitionRef.current.stop();
-      } catch {}
+      } catch {
+        // ignore
+      }
       recognitionRef.current = null;
     }
     setIsListening(false);
@@ -164,13 +213,17 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
     setInterimText("");
   }, []);
 
+  // Cleanup
   useEffect(() => {
     return () => {
       shouldBeListeningRef.current = false;
+      if (restartTimeoutRef.current) clearTimeout(restartTimeoutRef.current);
       if (recognitionRef.current) {
         try {
           recognitionRef.current.abort();
-        } catch {}
+        } catch {
+          // ignore
+        }
       }
     };
   }, []);
