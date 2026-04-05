@@ -16,7 +16,7 @@ import { broadcastToSession } from "../lib/ws";
 
 const app = new Hono();
 
-// Upload a chunk (idempotent — safe to retry)
+// Upload a chunk + transcribe it synchronously
 app.post("/upload", async (c) => {
   const formData = await c.req.formData();
   const file = formData.get("file") as File | null;
@@ -45,7 +45,6 @@ app.post("/upload", async (c) => {
     }
   }
 
-  // Check by recordingId + index (unique constraint)
   const existingByIndex = await db.query.chunks.findFirst({
     where: and(eq(chunks.recordingId, recordingId), eq(chunks.index, Number(chunkIndex))),
   });
@@ -53,7 +52,6 @@ app.post("/upload", async (c) => {
     return c.json(existingByIndex, 200);
   }
 
-  // Verify recording exists
   const recording = await db.query.recordings.findFirst({
     where: eq(recordings.id, recordingId),
   });
@@ -63,13 +61,12 @@ app.post("/upload", async (c) => {
 
   const buffer = Buffer.from(await file.arrayBuffer());
 
-  // Compute server-side checksum
   const serverChecksum = createHash("sha256").update(buffer).digest("hex");
   if (clientChecksum && clientChecksum !== serverChecksum) {
     return c.json({ error: "Checksum mismatch — data corrupted in transit" }, 422);
   }
 
-  // Write to WAL first
+  // WAL entry
   const [walEntry] = await db
     .insert(uploadWal)
     .values({
@@ -82,13 +79,11 @@ app.post("/upload", async (c) => {
     .onConflictDoNothing()
     .returning();
 
-  // Storage reference — audio is stored in DB and passed directly to transcription
   const storagePath = `db://${recordingId}/chunk-${chunkIndex}`;
+  const audioTs = audioStartedAt ? new Date(Number(audioStartedAt)) : null;
 
   // Upsert chunk record
   let chunk: typeof existingByIndex;
-  const audioTs = audioStartedAt ? new Date(Number(audioStartedAt)) : null;
-
   if (existingByIndex) {
     [chunk] = await db
       .update(chunks)
@@ -136,39 +131,102 @@ app.post("/upload", async (c) => {
       .where(eq(recordings.id, recordingId));
   }
 
-  // Broadcast chunk upload event
-  if (recording.sessionId && chunk) {
-    broadcastToSession(recording.sessionId, {
-      type: "chunk_uploaded",
-      participantId,
-      chunkIndex: Number(chunkIndex),
-      recordingId,
-    });
-  }
+  // --- TRANSCRIBE SYNCHRONOUSLY (critical for Vercel serverless) ---
+  let transcriptionText: string | null = null;
 
-  // Trigger transcription async — pass the audio buffer directly
   if (chunk && process.env.OPENAI_API_KEY) {
-    const chunkId = chunk.id;
-    triggerTranscription(
-      chunkId,
-      recordingId,
-      participantId,
-      buffer,
-      recording.languageCodes ?? [],
-      recording.sessionId,
-      audioTs?.getTime() ?? null,
-    ).catch((err) => {
-      console.error(`Transcription trigger failed for chunk ${chunkId}:`, err);
-    });
+    try {
+      // Look up participant name
+      let participantName = "Speaker";
+      if (participantId) {
+        const p = await db.query.participants.findFirst({
+          where: eq(participants.id, participantId),
+        });
+        if (p?.name) participantName = p.name;
+      }
+
+      const primaryLang = recording.languageCodes?.[0] ?? "en-US";
+      const result = await transcribeChunk(buffer, participantName, primaryLang);
+
+      // Save transcription record
+      const [txn] = await db
+        .insert(transcriptions)
+        .values({
+          chunkId: chunk.id,
+          recordingId,
+          participantId,
+          status: "completed",
+          fullText: result.fullText,
+          languageCode: result.languageCode,
+          confidence: result.confidence,
+          completedAt: new Date(),
+        })
+        .returning();
+
+      // Save speaker segments
+      if (txn && result.speakers.length > 0) {
+        const audioStartMs = audioTs?.getTime() ?? null;
+        await db.insert(speakerSegments).values(
+          result.speakers.map((seg) => ({
+            transcriptionId: txn.id,
+            recordingId,
+            participantId,
+            speakerTag: seg.speakerTag,
+            speakerLabel: participantName,
+            text: seg.text,
+            startTimeMs: seg.startTimeMs,
+            endTimeMs: seg.endTimeMs,
+            absoluteStartMs: audioStartMs ? audioStartMs + seg.startTimeMs : null,
+            languageCode: seg.languageCode,
+            confidence: seg.confidence,
+            wordTimings: seg.words,
+          })),
+        );
+      }
+
+      // Mark WAL transcribed
+      await db
+        .update(uploadWal)
+        .set({ transcribed: true, updatedAt: new Date() })
+        .where(eq(uploadWal.recordingId, recordingId));
+
+      transcriptionText = result.fullText;
+
+      // Broadcast to session
+      if (recording.sessionId) {
+        broadcastToSession(recording.sessionId, {
+          type: "transcription_ready",
+          chunkId: chunk.id,
+          participantId,
+          participantName,
+          text: result.fullText,
+          languageCode: result.languageCode,
+        });
+      }
+    } catch (err) {
+      console.error("Transcription failed:", err);
+      // Save failed transcription record
+      if (chunk) {
+        await db
+          .insert(transcriptions)
+          .values({
+            chunkId: chunk.id,
+            recordingId,
+            participantId,
+            status: "failed",
+            error: err instanceof Error ? err.message : "Transcription failed",
+          })
+          .onConflictDoNothing();
+      }
+    }
   }
 
-  return c.json(chunk, 201);
+  return c.json({ ...chunk, transcriptionText }, 201);
 });
 
 // Acknowledge a chunk
 app.patch("/:id/ack", async (c) => {
   const id = c.req.param("id");
-
   const [chunk] = await db
     .update(chunks)
     .set({ status: "acknowledged", acknowledgedAt: new Date() })
@@ -195,7 +253,7 @@ app.post("/reconcile/:recordingId", async (c) => {
 
   for (const chunk of allChunks) {
     if (chunk.gcsPath) {
-      const exists = await chunkExists(chunk.gcsPath);
+      const exists = chunkExists(chunk.gcsPath);
       if (!exists) {
         await db
           .update(chunks)
@@ -208,7 +266,6 @@ app.post("/reconcile/:recordingId", async (c) => {
     }
   }
 
-  // Check WAL
   const walEntries = await db
     .select()
     .from(uploadWal)
@@ -246,103 +303,5 @@ app.get("/status/:recordingId", async (c) => {
     })),
   });
 });
-
-/**
- * Trigger transcription for a chunk after upload.
- * Uses OpenAI Whisper with the audio buffer directly.
- */
-async function triggerTranscription(
-  chunkId: string,
-  recordingId: string,
-  participantId: string | null,
-  audioBuffer: Buffer,
-  languageCodes: string[],
-  sessionId: string | null,
-  audioStartMs: number | null,
-): Promise<void> {
-  const [txn] = await db
-    .insert(transcriptions)
-    .values({
-      chunkId,
-      recordingId,
-      participantId,
-      status: "processing",
-    })
-    .returning();
-
-  if (!txn) return;
-
-  try {
-    // Look up participant name for speaker labeling
-    let participantName = "Speaker";
-    if (participantId) {
-      const p = await db.query.participants.findFirst({
-        where: eq(participants.id, participantId),
-      });
-      if (p?.name) participantName = p.name;
-    }
-
-    const primaryLang = languageCodes[0] ?? "en-US";
-    const result = await transcribeChunk(audioBuffer, participantName, primaryLang);
-
-    // Save transcription
-    await db
-      .update(transcriptions)
-      .set({
-        status: "completed",
-        fullText: result.fullText,
-        languageCode: result.languageCode,
-        confidence: result.confidence,
-        completedAt: new Date(),
-      })
-      .where(eq(transcriptions.id, txn.id));
-
-    // Save speaker segments with participant name as label
-    if (result.speakers.length > 0) {
-      await db.insert(speakerSegments).values(
-        result.speakers.map((seg) => ({
-          transcriptionId: txn.id,
-          recordingId,
-          participantId,
-          speakerTag: seg.speakerTag,
-          speakerLabel: participantName,
-          text: seg.text,
-          startTimeMs: seg.startTimeMs,
-          endTimeMs: seg.endTimeMs,
-          absoluteStartMs: audioStartMs ? audioStartMs + seg.startTimeMs : null,
-          languageCode: seg.languageCode,
-          confidence: seg.confidence,
-          wordTimings: seg.words,
-        })),
-      );
-    }
-
-    // Broadcast transcription result via WebSocket
-    if (sessionId) {
-      broadcastToSession(sessionId, {
-        type: "transcription_ready",
-        chunkId,
-        participantId,
-        participantName,
-        text: result.fullText,
-        languageCode: result.languageCode,
-      });
-    }
-
-    // Mark WAL as transcribed
-    await db
-      .update(uploadWal)
-      .set({ transcribed: true, updatedAt: new Date() })
-      .where(and(eq(uploadWal.recordingId, recordingId)));
-  } catch (err) {
-    await db
-      .update(transcriptions)
-      .set({
-        status: "failed",
-        error: err instanceof Error ? err.message : "Transcription failed",
-      })
-      .where(eq(transcriptions.id, txn.id));
-  }
-}
 
 export default app;

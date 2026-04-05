@@ -42,8 +42,11 @@ export async function transcribeChunk(
   const client = getClient();
 
   // Create a File object from buffer for the API
-  const blob = new Blob([audioBuffer as unknown as BlobPart], { type: "audio/wav" });
-  const file = new File([blob], "audio.wav", { type: "audio/wav" });
+  const file = new File(
+    [new Uint8Array(audioBuffer) as unknown as Uint8Array<ArrayBuffer>],
+    "audio.wav",
+    { type: "audio/wav" },
+  );
 
   const response = await client.audio.transcriptions.create({
     model: "whisper-1",

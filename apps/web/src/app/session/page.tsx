@@ -133,7 +133,7 @@ export default function SessionPage() {
           .catch(() => {});
       };
       poll();
-      pollRef.current = setInterval(poll, 5000);
+      pollRef.current = setInterval(poll, 2000);
       return () => {
         if (pollRef.current) clearInterval(pollRef.current);
       };
