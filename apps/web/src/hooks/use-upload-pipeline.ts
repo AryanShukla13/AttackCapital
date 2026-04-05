@@ -12,6 +12,7 @@ export interface TrackedChunk {
   uploadStatus: ChunkUploadStatus;
   serverChunkId?: string;
   error?: string;
+  transcriptionError?: string;
   retryCount: number;
 }
 
@@ -123,7 +124,14 @@ export function useUploadPipeline() {
           participantId ?? undefined,
           audioStartedAt,
         );
-        updateChunk(chunk.id, { uploadStatus: "acknowledged", serverChunkId: serverChunk.id });
+        const txError = (serverChunk as unknown as Record<string, unknown>).transcriptionError as
+          | string
+          | undefined;
+        updateChunk(chunk.id, {
+          uploadStatus: "acknowledged",
+          serverChunkId: serverChunk.id,
+          transcriptionError: txError ?? undefined,
+        });
 
         await api.acknowledgeChunk(serverChunk.id);
         await removeChunkFromOPFS(sessionRecId, index);

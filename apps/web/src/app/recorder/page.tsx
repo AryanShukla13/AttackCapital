@@ -557,15 +557,39 @@ export default function RecorderPage() {
                 <Loader2 className="size-4 animate-spin" />
                 Transcribing audio...
               </div>
+            ) : pipeline.trackedChunks.some((tc) => tc.transcriptionError) ? (
+              <div className="flex flex-col items-center gap-3 py-8 text-sm">
+                <AlertTriangle className="size-8 text-red-500/50" />
+                <p className="text-center text-red-400">
+                  {pipeline.trackedChunks.find((tc) => tc.transcriptionError)?.transcriptionError}
+                </p>
+                {pipeline.trackedChunks[0]?.transcriptionError?.includes("quota") && (
+                  <p className="text-center text-xs text-muted-foreground">
+                    Add billing at{" "}
+                    <a
+                      href="https://platform.openai.com/settings/organization/billing"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="underline"
+                    >
+                      platform.openai.com/billing
+                    </a>
+                  </p>
+                )}
+              </div>
             ) : isActive ? (
               <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
                 <Loader2 className="size-4 animate-spin" />
                 Recording... transcript will appear after chunks are processed
               </div>
+            ) : ackedCount > 0 ? (
+              <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" />
+                Processing transcription...
+              </div>
             ) : (
               <p className="py-4 text-center text-sm text-muted-foreground">
-                No transcription data yet. Make sure the server is configured with GCS and
-                Speech-to-Text credentials.
+                Start recording to see transcription
               </p>
             )}
           </CardContent>
