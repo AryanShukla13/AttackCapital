@@ -6,7 +6,21 @@ const app = new Hono();
 
 // Create a new recording session
 app.post("/", async (c) => {
-  const [recording] = await db.insert(recordings).values({ status: "recording" }).returning();
+  const body = await c.req
+    .json<{
+      speakerCount?: number;
+      languages?: string[];
+    }>()
+    .catch((): { speakerCount?: number; languages?: string[] } => ({}));
+
+  const [recording] = await db
+    .insert(recordings)
+    .values({
+      status: "recording",
+      speakerCount: body.speakerCount ?? 2,
+      languageCodes: body.languages ?? ["en-US"],
+    })
+    .returning();
   return c.json(recording, 201);
 });
 

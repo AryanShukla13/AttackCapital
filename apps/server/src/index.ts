@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import chunksRoutes from "./routes/chunks";
 import recordingsRoutes from "./routes/recordings";
+import transcriptionsRoutes from "./routes/transcriptions";
 
 const app = new Hono();
 
@@ -21,5 +22,6 @@ app.get("/health", (c) => c.json({ status: "healthy", timestamp: new Date().toIS
 
 app.route("/api/recordings", recordingsRoutes);
 app.route("/api/chunks", chunksRoutes);
+app.route("/api/transcriptions", transcriptionsRoutes);
 
 export default app;

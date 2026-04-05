@@ -23,6 +23,8 @@ export interface Recording {
   status: string;
   totalChunks: number;
   sampleRate: number;
+  speakerCount: number;
+  languageCodes: string[];
   createdAt: string;
   completedAt: string | null;
 }
@@ -35,12 +37,56 @@ export interface Chunk {
   gcsPath: string | null;
   status: string;
   checksum: string | null;
+  retryCount: number;
   createdAt: string;
   acknowledgedAt: string | null;
 }
 
-export async function createRecording(): Promise<Recording> {
-  return request("/api/recordings", { method: "POST" });
+export interface SpeakerSegment {
+  id: string;
+  transcriptionId: string;
+  recordingId: string;
+  speakerTag: number;
+  speakerLabel: string | null;
+  text: string;
+  startTimeMs: number;
+  endTimeMs: number;
+  languageCode: string | null;
+  confidence: number | null;
+  wordTimings: Array<{ word: string; startMs: number; endMs: number; confidence: number }>;
+}
+
+export interface TranscriptionStatus {
+  total: number;
+  completed: number;
+  processing: number;
+  failed: number;
+}
+
+export interface TranscriptionResponse {
+  recordingId: string;
+  status: TranscriptionStatus;
+  speakers: Array<{
+    tag: number;
+    label: string;
+    languages: string[];
+    segmentCount: number;
+  }>;
+  fullTranscript: string;
+  segments: SpeakerSegment[];
+}
+
+// --- Recordings ---
+
+export async function createRecording(
+  speakerCount?: number,
+  languages?: string[],
+): Promise<Recording> {
+  return request("/api/recordings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ speakerCount, languages }),
+  });
 }
 
 export async function completeRecording(id: string): Promise<Recording> {
@@ -51,12 +97,15 @@ export async function getRecording(id: string): Promise<Recording & { chunks: Ch
   return request(`/api/recordings/${id}`);
 }
 
+// --- Chunks ---
+
 export async function uploadChunk(
   recordingId: string,
   chunkIndex: number,
   blob: Blob,
   durationMs: number,
   checksum: string,
+  idempotencyKey?: string,
 ): Promise<Chunk> {
   const formData = new FormData();
   formData.append("file", blob, `chunk-${chunkIndex}.wav`);
@@ -64,6 +113,9 @@ export async function uploadChunk(
   formData.append("chunkIndex", String(chunkIndex));
   formData.append("durationMs", String(durationMs));
   formData.append("checksum", checksum);
+  if (idempotencyKey) {
+    formData.append("idempotencyKey", idempotencyKey);
+  }
 
   return request("/api/chunks/upload", { method: "POST", body: formData });
 }
@@ -82,11 +134,19 @@ export async function reconcileRecording(recordingId: string): Promise<Reconcile
   return request(`/api/chunks/reconcile/${recordingId}`, { method: "POST" });
 }
 
-export async function getChunkStatus(
+// --- Transcriptions ---
+
+export async function getTranscriptions(recordingId: string): Promise<TranscriptionResponse> {
+  return request(`/api/transcriptions/${recordingId}`);
+}
+
+export async function setRecordingLanguages(
   recordingId: string,
-): Promise<{
-  recordingId: string;
-  chunks: Array<{ id: string; index: number; status: string; hasGcsPath: boolean }>;
-}> {
-  return request(`/api/chunks/status/${recordingId}`);
+  languages: string[],
+): Promise<Recording> {
+  return request(`/api/transcriptions/languages/${recordingId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ languages }),
+  });
 }

@@ -6,7 +6,9 @@ import {
   Check,
   Cloud,
   Download,
+  Globe,
   Loader2,
+  MessageSquare,
   Mic,
   Pause,
   Play,
@@ -14,6 +16,7 @@ import {
   Square,
   Trash2,
   Upload,
+  Users,
 } from "lucide-react";
 
 import { Button } from "@my-better-t-app/ui/components/button";
@@ -24,9 +27,33 @@ import {
   CardHeader,
   CardTitle,
 } from "@my-better-t-app/ui/components/card";
+import { Input } from "@my-better-t-app/ui/components/input";
+import { Label } from "@my-better-t-app/ui/components/label";
 import { LiveWaveform } from "@/components/ui/live-waveform";
 import { useRecorder, type WavChunk } from "@/hooks/use-recorder";
 import { useUploadPipeline, type TrackedChunk } from "@/hooks/use-upload-pipeline";
+import * as api from "@/lib/api";
+
+const LANGUAGE_OPTIONS = [
+  { code: "en-US", label: "English (US)" },
+  { code: "en-GB", label: "English (UK)" },
+  { code: "hi-IN", label: "Hindi" },
+  { code: "es-ES", label: "Spanish" },
+  { code: "fr-FR", label: "French" },
+  { code: "de-DE", label: "German" },
+  { code: "zh-CN", label: "Chinese (Mandarin)" },
+  { code: "ja-JP", label: "Japanese" },
+  { code: "ko-KR", label: "Korean" },
+  { code: "ar-SA", label: "Arabic" },
+  { code: "pt-BR", label: "Portuguese (BR)" },
+  { code: "ru-RU", label: "Russian" },
+  { code: "it-IT", label: "Italian" },
+  { code: "bn-IN", label: "Bengali" },
+  { code: "ta-IN", label: "Tamil" },
+  { code: "te-IN", label: "Telugu" },
+  { code: "mr-IN", label: "Marathi" },
+  { code: "gu-IN", label: "Gujarati" },
+];
 
 function formatTime(seconds: number) {
   const m = Math.floor(seconds / 60);
@@ -95,11 +122,13 @@ function ChunkRow({
       <span className="text-xs tabular-nums">{formatDuration(chunk.duration)}</span>
       <span className="text-[10px] text-muted-foreground">16kHz PCM</span>
 
-      {/* Upload status */}
       {tracked && (
         <div className="flex items-center gap-1">
           {statusIcon(tracked.uploadStatus)}
           <span className="text-[10px] text-muted-foreground">{tracked.uploadStatus}</span>
+          {tracked.retryCount > 0 && (
+            <span className="text-[10px] text-muted-foreground">(retry {tracked.retryCount})</span>
+          )}
         </div>
       )}
 
@@ -120,6 +149,22 @@ function ChunkRow({
   );
 }
 
+function speakerColor(tag: number): string {
+  const colors = [
+    "text-blue-400",
+    "text-green-400",
+    "text-purple-400",
+    "text-orange-400",
+    "text-pink-400",
+    "text-cyan-400",
+    "text-yellow-400",
+    "text-red-400",
+    "text-indigo-400",
+    "text-emerald-400",
+  ];
+  return colors[tag % colors.length] ?? "text-muted-foreground";
+}
+
 export default function RecorderPage() {
   const [deviceId] = useState<string | undefined>();
   const { status, start, stop, pause, resume, chunks, elapsed, stream, clearChunks } = useRecorder({
@@ -130,6 +175,15 @@ export default function RecorderPage() {
   const pipeline = useUploadPipeline();
   const prevChunkCountRef = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
+
+  // Config state
+  const [speakerCount, setSpeakerCount] = useState(2);
+  const [selectedLanguages, setSelectedLanguages] = useState<string[]>(["en-US"]);
+
+  // Transcription state
+  const [transcription, setTranscription] = useState<api.TranscriptionResponse | null>(null);
+  const [isLoadingTranscript, setIsLoadingTranscript] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const isRecording = status === "recording";
   const isPaused = status === "paused";
@@ -146,19 +200,57 @@ export default function RecorderPage() {
     prevChunkCountRef.current = chunks.length;
   }, [chunks, pipeline]);
 
+  // Poll transcription while recording or shortly after
+  useEffect(() => {
+    if (
+      pipeline.recordingId &&
+      pipeline.trackedChunks.some((tc) => tc.uploadStatus === "acknowledged")
+    ) {
+      const poll = () => {
+        api
+          .getTranscriptions(pipeline.recordingId!)
+          .then(setTranscription)
+          .catch(() => {});
+      };
+      poll();
+      pollRef.current = setInterval(poll, 5000);
+      return () => {
+        if (pollRef.current) clearInterval(pollRef.current);
+      };
+    }
+  }, [pipeline.recordingId, pipeline.trackedChunks]);
+
   const handlePrimary = useCallback(async () => {
     if (isActive) {
       stop();
-      // Complete the recording session on server
       await pipeline.completeSession();
+      // Final transcript fetch
+      if (pipeline.recordingId) {
+        setIsLoadingTranscript(true);
+        // Wait a bit for last transcription to process
+        setTimeout(async () => {
+          try {
+            const txn = await api.getTranscriptions(pipeline.recordingId!);
+            setTranscription(txn);
+          } finally {
+            setIsLoadingTranscript(false);
+          }
+        }, 3000);
+      }
     } else {
-      // Start a new server session, then start recording
-      const sessionId = await pipeline.startSession();
+      setTranscription(null);
+      const sessionId = await pipeline.startSession(speakerCount, selectedLanguages);
       sessionIdRef.current = sessionId;
       prevChunkCountRef.current = 0;
       start();
     }
-  }, [isActive, stop, start, pipeline]);
+  }, [isActive, stop, start, pipeline, speakerCount, selectedLanguages]);
+
+  const toggleLanguage = (code: string) => {
+    setSelectedLanguages((prev) =>
+      prev.includes(code) ? prev.filter((l) => l !== code) : [...prev, code],
+    );
+  };
 
   const failedCount = pipeline.trackedChunks.filter((tc) => tc.uploadStatus === "failed").length;
   const ackedCount = pipeline.trackedChunks.filter(
@@ -166,11 +258,71 @@ export default function RecorderPage() {
   ).length;
 
   return (
-    <div className="container mx-auto flex max-w-lg flex-col items-center gap-6 px-4 py-8">
+    <div className="container mx-auto flex max-w-2xl flex-col items-center gap-6 px-4 py-8">
+      {/* Recording Config */}
+      {!isActive && !pipeline.recordingId && (
+        <Card className="w-full">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Users className="size-4" />
+              Recording Setup
+            </CardTitle>
+            <CardDescription>Configure speakers and languages before recording</CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-4">
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="speakers" className="flex items-center gap-1.5 text-sm">
+                <Users className="size-3.5" />
+                Expected speakers (1-10)
+              </Label>
+              <Input
+                id="speakers"
+                type="number"
+                min={1}
+                max={10}
+                value={speakerCount}
+                onChange={(e) => setSpeakerCount(Math.max(1, Math.min(10, Number(e.target.value))))}
+                className="w-24"
+              />
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <Label className="flex items-center gap-1.5 text-sm">
+                <Globe className="size-3.5" />
+                Languages spoken (select all that apply)
+              </Label>
+              <div className="flex flex-wrap gap-1.5">
+                {LANGUAGE_OPTIONS.map((lang) => (
+                  <button
+                    key={lang.code}
+                    type="button"
+                    onClick={() => toggleLanguage(lang.code)}
+                    className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${
+                      selectedLanguages.includes(lang.code)
+                        ? "border-primary bg-primary/10 text-primary"
+                        : "border-border text-muted-foreground hover:bg-muted"
+                    }`}
+                  >
+                    {lang.label}
+                  </button>
+                ))}
+              </div>
+              {selectedLanguages.length === 0 && (
+                <p className="text-xs text-red-500">Select at least one language</p>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Recorder */}
       <Card className="w-full">
         <CardHeader>
           <CardTitle>Recorder</CardTitle>
-          <CardDescription>16 kHz / 16-bit PCM WAV — chunked every 5 s</CardDescription>
+          <CardDescription>
+            16 kHz / 16-bit PCM WAV — chunked every 5 s — {speakerCount} speaker(s),{" "}
+            {selectedLanguages.length} language(s)
+          </CardDescription>
         </CardHeader>
 
         <CardContent className="flex flex-col gap-6">
@@ -210,6 +362,12 @@ export default function RecorderPage() {
                   {failedCount} failed
                 </span>
               )}
+              {transcription && (
+                <span className="flex items-center gap-1">
+                  <MessageSquare className="size-3 text-blue-500" />
+                  {transcription.status.completed} transcribed
+                </span>
+              )}
               {pipeline.recordingId && (
                 <span className="text-[10px] font-mono">{pipeline.recordingId.slice(0, 8)}...</span>
               )}
@@ -223,7 +381,7 @@ export default function RecorderPage() {
               variant={isActive ? "destructive" : "default"}
               className="gap-2 px-5"
               onClick={handlePrimary}
-              disabled={status === "requesting"}
+              disabled={status === "requesting" || selectedLanguages.length === 0}
             >
               {isActive ? (
                 <>
@@ -259,7 +417,6 @@ export default function RecorderPage() {
               </Button>
             )}
 
-            {/* Reconcile button */}
             {!isActive && pipeline.recordingId && failedCount > 0 && (
               <Button
                 size="lg"
@@ -305,6 +462,62 @@ export default function RecorderPage() {
               <Trash2 className="size-3" />
               Clear all
             </Button>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Live Transcription */}
+      {(transcription || isLoadingTranscript) && (
+        <Card className="w-full">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <MessageSquare className="size-4" />
+              Transcription
+              {isLoadingTranscript && <Loader2 className="size-4 animate-spin" />}
+            </CardTitle>
+            {transcription && (
+              <CardDescription>
+                {transcription.speakers.length} speaker(s) detected —{" "}
+                {transcription.status.completed}/{transcription.status.total} chunks transcribed
+                {transcription.status.processing > 0 &&
+                  ` (${transcription.status.processing} processing)`}
+              </CardDescription>
+            )}
+          </CardHeader>
+          <CardContent>
+            {transcription && transcription.segments.length > 0 ? (
+              <div className="flex flex-col gap-3 rounded-sm border border-border/50 bg-muted/10 p-4">
+                {transcription.segments.map((seg) => (
+                  <div key={seg.id} className="flex gap-3">
+                    <div className="flex flex-col items-end">
+                      <span className={`text-xs font-semibold ${speakerColor(seg.speakerTag)}`}>
+                        {seg.speakerLabel ?? `Speaker ${seg.speakerTag}`}
+                      </span>
+                      {seg.languageCode && (
+                        <span className="text-[10px] text-muted-foreground">
+                          {seg.languageCode}
+                        </span>
+                      )}
+                    </div>
+                    <p className="flex-1 text-sm leading-relaxed">{seg.text}</p>
+                    {seg.confidence != null && (
+                      <span className="text-[10px] text-muted-foreground tabular-nums">
+                        {(seg.confidence * 100).toFixed(0)}%
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : transcription && transcription.status.processing > 0 ? (
+              <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" />
+                Transcribing audio...
+              </div>
+            ) : transcription && transcription.status.total === 0 ? (
+              <p className="py-4 text-center text-sm text-muted-foreground">
+                Waiting for chunks to be uploaded and transcribed...
+              </p>
+            ) : null}
           </CardContent>
         </Card>
       )}
