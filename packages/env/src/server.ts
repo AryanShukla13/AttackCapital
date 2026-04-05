@@ -4,7 +4,7 @@ import { z } from "zod";
 
 export const env = createEnv({
   server: {
-    DATABASE_URL: z.string().min(1),
+    DATABASE_URL: z.string().default(""),
     CORS_ORIGIN: z.string().default("*"),
     NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
     GCS_BUCKET_NAME: z.string().default(""),
@@ -13,5 +13,4 @@ export const env = createEnv({
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: false,
-  skipValidation: process.env.SKIP_ENV_VALIDATION === "1",
 });
