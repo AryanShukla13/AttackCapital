@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Copy,
@@ -140,6 +140,19 @@ export default function RecorderPage() {
   const isPaused = status === "paused";
   const isActive = isRecording || isPaused;
 
+  // Start speech recognition once recorder is actually recording
+  const prevStatusRef = useRef(status);
+  useEffect(() => {
+    if (prevStatusRef.current === "requesting" && status === "recording") {
+      // Mic granted, now safe to start speech recognition
+      speech.startListening();
+    }
+    if (prevStatusRef.current === "recording" && status === "idle") {
+      speech.stopListening();
+    }
+    prevStatusRef.current = status;
+  }, [status, speech]);
+
   const handlePrimary = useCallback(() => {
     if (isActive) {
       stop();
@@ -147,8 +160,7 @@ export default function RecorderPage() {
     } else {
       setHasRecorded(true);
       speech.clearTranscript();
-      start();
-      speech.startListening();
+      start(); // This requests mic — speech recognition starts via useEffect above
     }
   }, [isActive, stop, start, speech]);
 
