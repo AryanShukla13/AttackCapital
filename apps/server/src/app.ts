@@ -7,13 +7,13 @@ import recordingsRoutes from "./routes/recordings";
 import sessionsRoutes from "./routes/sessions";
 import transcriptionsRoutes from "./routes/transcriptions";
 
-const app = new Hono();
+const app = new Hono().basePath("/api");
 
 app.use(logger());
 app.use(
   "/*",
   cors({
-    origin: env.CORS_ORIGIN,
+    origin: "*",
     allowMethods: ["GET", "POST", "PATCH", "OPTIONS"],
   }),
 );
@@ -21,9 +21,9 @@ app.use(
 app.get("/", (c) => c.text("OK"));
 app.get("/health", (c) => c.json({ status: "healthy", timestamp: new Date().toISOString() }));
 
-app.route("/api/sessions", sessionsRoutes);
-app.route("/api/recordings", recordingsRoutes);
-app.route("/api/chunks", chunksRoutes);
-app.route("/api/transcriptions", transcriptionsRoutes);
+app.route("/sessions", sessionsRoutes);
+app.route("/recordings", recordingsRoutes);
+app.route("/chunks", chunksRoutes);
+app.route("/transcriptions", transcriptionsRoutes);
 
 export default app;
