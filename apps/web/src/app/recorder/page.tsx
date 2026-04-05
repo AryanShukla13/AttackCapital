@@ -3,12 +3,12 @@
 import { useCallback, useRef, useState } from "react";
 import {
   AlertTriangle,
-  Check,
+  Copy,
   Download,
   Globe,
+  MessageSquare,
   Mic,
   MicOff,
-  MessageSquare,
   Pause,
   Play,
   Square,
@@ -28,7 +28,7 @@ import { Input } from "@my-better-t-app/ui/components/input";
 import { Label } from "@my-better-t-app/ui/components/label";
 import { LiveWaveform } from "@/components/ui/live-waveform";
 import { useRecorder, type WavChunk } from "@/hooks/use-recorder";
-import { useSpeechRecognition } from "@/hooks/use-speech-recognition";
+import { useMultiSpeaker } from "@/hooks/use-multi-speaker";
 
 const LANGUAGE_OPTIONS = [
   { code: "en-US", label: "English (US)" },
@@ -104,16 +104,18 @@ function ChunkRow({ chunk, index }: { chunk: WavChunk; index: number }) {
   );
 }
 
-function speakerColor(index: number): string {
-  const colors = [
-    "text-blue-400",
-    "text-green-400",
-    "text-purple-400",
-    "text-orange-400",
-    "text-pink-400",
-  ];
-  return colors[index % colors.length] ?? "text-muted-foreground";
-}
+const SPEAKER_COLORS = [
+  "text-blue-400",
+  "text-green-400",
+  "text-purple-400",
+  "text-orange-400",
+  "text-pink-400",
+  "text-cyan-400",
+  "text-yellow-400",
+  "text-red-400",
+  "text-indigo-400",
+  "text-emerald-400",
+];
 
 export default function RecorderPage() {
   const [deviceId] = useState<string | undefined>();
@@ -127,10 +129,11 @@ export default function RecorderPage() {
   const [selectedLanguage, setSelectedLanguage] = useState("en-US");
   const [hasRecorded, setHasRecorded] = useState(false);
 
-  // Real-time speech recognition (free, browser-based)
-  const speech = useSpeechRecognition({
+  // Multi-speaker real-time transcription (free, browser-based)
+  const speech = useMultiSpeaker({
     language: selectedLanguage,
-    speakerLabel: "Speaker",
+    speakerCount,
+    silenceThresholdMs: 1500,
   });
 
   const isRecording = status === "recording";
@@ -159,6 +162,8 @@ export default function RecorderPage() {
     }
   }, [isPaused, resume, pause, speech]);
 
+  const transcriptEndRef = useRef<HTMLDivElement>(null);
+
   return (
     <div className="container mx-auto flex max-w-2xl flex-col items-center gap-6 px-4 py-8">
       {/* Recording Config */}
@@ -169,13 +174,13 @@ export default function RecorderPage() {
               <Users className="size-4" />
               Recording Setup
             </CardTitle>
-            <CardDescription>Configure language before recording</CardDescription>
+            <CardDescription>Configure speakers and language before recording</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
             <div className="flex flex-col gap-2">
               <Label htmlFor="speakers" className="flex items-center gap-1.5 text-sm">
                 <Users className="size-3.5" />
-                Expected speakers (1-10)
+                Number of speakers (1-10)
               </Label>
               <Input
                 id="speakers"
@@ -186,6 +191,9 @@ export default function RecorderPage() {
                 onChange={(e) => setSpeakerCount(Math.max(1, Math.min(10, Number(e.target.value))))}
                 className="w-24"
               />
+              <p className="text-[11px] text-muted-foreground">
+                Speaker changes are detected by pauses in speech (~1.5s gap = new speaker)
+              </p>
             </div>
 
             <div className="flex flex-col gap-2">
@@ -226,13 +234,13 @@ export default function RecorderPage() {
         <CardHeader>
           <CardTitle>Recorder</CardTitle>
           <CardDescription>
-            16 kHz / 16-bit PCM WAV — chunked every 5 s —{" "}
+            {speakerCount} speaker(s) —{" "}
             {LANGUAGE_OPTIONS.find((l) => l.code === selectedLanguage)?.label ?? selectedLanguage}
+            {" — "}Free real-time transcription
           </CardDescription>
         </CardHeader>
 
         <CardContent className="flex flex-col gap-6">
-          {/* Waveform */}
           <div className="overflow-hidden rounded-sm border border-border/50 bg-muted/20 text-foreground">
             <LiveWaveform
               active={isRecording}
@@ -250,7 +258,6 @@ export default function RecorderPage() {
             />
           </div>
 
-          {/* Timer + live status */}
           <div className="flex flex-col items-center gap-1">
             <div className="text-center font-mono text-3xl tabular-nums tracking-tight">
               {formatTime(elapsed)}
@@ -258,12 +265,11 @@ export default function RecorderPage() {
             {speech.isListening && (
               <div className="flex items-center gap-1.5 text-xs text-green-500">
                 <Mic className="size-3 animate-pulse" />
-                Transcribing live...
+                Transcribing live — {speech.segments.length} segment(s)
               </div>
             )}
           </div>
 
-          {/* Controls */}
           <div className="flex items-center justify-center gap-3">
             <Button
               size="lg"
@@ -304,7 +310,7 @@ export default function RecorderPage() {
         </CardContent>
       </Card>
 
-      {/* Live Transcription — real-time, free, browser-based */}
+      {/* Live Transcription */}
       {hasRecorded && (
         <Card className="w-full">
           <CardHeader>
@@ -319,7 +325,8 @@ export default function RecorderPage() {
               )}
             </CardTitle>
             <CardDescription>
-              {speech.segments.length} segment(s) — powered by browser Speech Recognition (free)
+              {speech.segments.length} segment(s) — {speech.speakerTranscripts.length} speaker(s)
+              detected — free browser-based recognition
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -329,16 +336,18 @@ export default function RecorderPage() {
                 {speech.error}
               </div>
             ) : speech.segments.length > 0 || speech.interimText ? (
-              <div className="flex max-h-96 flex-col gap-2 overflow-y-auto rounded-sm border border-border/50 bg-muted/10 p-4">
-                {speech.segments.map((seg, i) => (
+              <div className="flex max-h-[500px] flex-col gap-2 overflow-y-auto rounded-sm border border-border/50 bg-muted/10 p-4">
+                {speech.segments.map((seg) => (
                   <div key={seg.id} className="flex gap-3">
                     <span
-                      className={`min-w-[60px] text-right text-xs font-semibold ${speakerColor(0)}`}
+                      className={`min-w-[80px] text-right text-xs font-semibold ${
+                        SPEAKER_COLORS[seg.speakerIndex % SPEAKER_COLORS.length]
+                      }`}
                     >
                       {seg.speakerLabel}
                     </span>
                     <p className="flex-1 text-sm leading-relaxed">{seg.text}</p>
-                    <span className="text-[10px] text-muted-foreground tabular-nums">
+                    <span className="shrink-0 text-[10px] text-muted-foreground tabular-nums">
                       {new Date(seg.timestamp).toLocaleTimeString([], {
                         hour: "2-digit",
                         minute: "2-digit",
@@ -347,17 +356,15 @@ export default function RecorderPage() {
                     </span>
                   </div>
                 ))}
-                {/* Interim (not-yet-final) text */}
                 {speech.interimText && (
                   <div className="flex gap-3 opacity-50">
-                    <span
-                      className={`min-w-[60px] text-right text-xs font-semibold ${speakerColor(0)}`}
-                    >
+                    <span className="min-w-[80px] text-right text-xs font-semibold text-muted-foreground">
                       ...
                     </span>
                     <p className="flex-1 text-sm italic leading-relaxed">{speech.interimText}</p>
                   </div>
                 )}
+                <div ref={transcriptEndRef} />
               </div>
             ) : isActive ? (
               <p className="py-6 text-center text-sm text-muted-foreground">
@@ -369,21 +376,51 @@ export default function RecorderPage() {
               </p>
             )}
 
-            {/* Full transcript summary (shown after stop) */}
-            {!isActive && speech.fullText && (
-              <div className="mt-4 border-t border-border/50 pt-4">
-                <div className="flex items-center justify-between">
-                  <h4 className="text-xs font-semibold text-muted-foreground">Full Transcript</h4>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="gap-1 text-xs"
-                    onClick={() => navigator.clipboard.writeText(speech.fullText)}
-                  >
-                    Copy
-                  </Button>
+            {/* Full transcript + per-speaker breakdown */}
+            {!isActive && speech.segments.length > 0 && (
+              <div className="mt-4 space-y-4 border-t border-border/50 pt-4">
+                {/* Per-speaker summary */}
+                {speech.speakerTranscripts.length > 1 && (
+                  <div className="space-y-3">
+                    <h4 className="text-xs font-semibold text-muted-foreground">Per Speaker</h4>
+                    {speech.speakerTranscripts.map((st) => (
+                      <div key={st.speaker} className="rounded-sm border border-border/30 p-3">
+                        <div className="flex items-center justify-between">
+                          <span
+                            className={`text-xs font-semibold ${
+                              SPEAKER_COLORS[st.speaker % SPEAKER_COLORS.length]
+                            }`}
+                          >
+                            {st.label}
+                          </span>
+                          <span className="text-[10px] text-muted-foreground">
+                            {st.segmentCount} segment(s)
+                          </span>
+                        </div>
+                        <p className="mt-1 text-sm leading-relaxed">{st.text}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Full transcript */}
+                <div>
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-semibold text-muted-foreground">Full Transcript</h4>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="gap-1 text-xs"
+                      onClick={() => navigator.clipboard.writeText(speech.fullText)}
+                    >
+                      <Copy className="size-3" />
+                      Copy
+                    </Button>
+                  </div>
+                  <pre className="mt-2 whitespace-pre-wrap text-sm leading-relaxed">
+                    {speech.fullText}
+                  </pre>
                 </div>
-                <p className="mt-2 text-sm leading-relaxed">{speech.fullText}</p>
               </div>
             )}
           </CardContent>
