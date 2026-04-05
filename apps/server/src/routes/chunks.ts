@@ -10,8 +10,8 @@ import {
 import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { createHash } from "node:crypto";
-import { chunkExists, uploadChunk } from "../lib/gcs";
-import { gcsUri, transcribeChunk } from "../lib/transcribe";
+import { chunkExists } from "../lib/gcs";
+import { transcribeChunk } from "../lib/transcribe";
 import { broadcastToSession } from "../lib/ws";
 
 const app = new Hono();
@@ -82,23 +82,8 @@ app.post("/upload", async (c) => {
     .onConflictDoNothing()
     .returning();
 
-  // Upload to GCS — path includes participant for isolation
-  let gcsPath: string;
-  try {
-    const pathPrefix = participantId ? `${recordingId}/${participantId}` : recordingId;
-    gcsPath = await uploadChunk(pathPrefix, Number(chunkIndex), buffer);
-  } catch (err) {
-    if (walEntry) {
-      await db
-        .update(uploadWal)
-        .set({
-          lastError: err instanceof Error ? err.message : "Upload failed",
-          updatedAt: new Date(),
-        })
-        .where(eq(uploadWal.id, walEntry.id));
-    }
-    return c.json({ error: "Failed to upload to storage" }, 502);
-  }
+  // Storage reference — audio is stored in DB and passed directly to transcription
+  const storagePath = `db://${recordingId}/chunk-${chunkIndex}`;
 
   // Upsert chunk record
   let chunk: typeof existingByIndex;
@@ -108,7 +93,7 @@ app.post("/upload", async (c) => {
     [chunk] = await db
       .update(chunks)
       .set({
-        gcsPath,
+        gcsPath: storagePath,
         status: "uploaded",
         checksum: serverChecksum,
         retryCount: existingByIndex.retryCount + 1,
@@ -126,7 +111,7 @@ app.post("/upload", async (c) => {
         participantId,
         index: Number(chunkIndex),
         duration: Number(durationMs),
-        gcsPath,
+        gcsPath: storagePath,
         status: "uploaded",
         checksum: serverChecksum,
         idempotencyKey,
@@ -139,7 +124,7 @@ app.post("/upload", async (c) => {
   if (walEntry) {
     await db
       .update(uploadWal)
-      .set({ gcsPath, uploaded: true, updatedAt: new Date() })
+      .set({ gcsPath: storagePath, uploaded: true, updatedAt: new Date() })
       .where(eq(uploadWal.id, walEntry.id));
   }
 
@@ -151,7 +136,7 @@ app.post("/upload", async (c) => {
       .where(eq(recordings.id, recordingId));
   }
 
-  // Broadcast chunk upload event to session participants via WebSocket
+  // Broadcast chunk upload event
   if (recording.sessionId && chunk) {
     broadcastToSession(recording.sessionId, {
       type: "chunk_uploaded",
@@ -161,14 +146,14 @@ app.post("/upload", async (c) => {
     });
   }
 
-  // Trigger transcription async
-  if (chunk) {
+  // Trigger transcription async — pass the audio buffer directly
+  if (chunk && process.env.OPENAI_API_KEY) {
     const chunkId = chunk.id;
     triggerTranscription(
       chunkId,
       recordingId,
       participantId,
-      gcsPath,
+      buffer,
       recording.languageCodes ?? [],
       recording.sessionId,
       audioTs?.getTime() ?? null,
@@ -264,12 +249,13 @@ app.get("/status/:recordingId", async (c) => {
 
 /**
  * Trigger transcription for a chunk after upload.
+ * Uses OpenAI Whisper with the audio buffer directly.
  */
 async function triggerTranscription(
   chunkId: string,
   recordingId: string,
   participantId: string | null,
-  gcsPath: string,
+  audioBuffer: Buffer,
   languageCodes: string[],
   sessionId: string | null,
   audioStartMs: number | null,
@@ -288,19 +274,16 @@ async function triggerTranscription(
 
   try {
     // Look up participant name for speaker labeling
-    let participantName: string | null = null;
+    let participantName = "Speaker";
     if (participantId) {
       const p = await db.query.participants.findFirst({
         where: eq(participants.id, participantId),
       });
-      participantName = p?.name ?? null;
+      if (p?.name) participantName = p.name;
     }
 
-    const result = await transcribeChunk(
-      gcsUri(gcsPath),
-      1, // each device has 1 speaker
-      languageCodes.length > 0 ? languageCodes : ["en-US"],
-    );
+    const primaryLang = languageCodes[0] ?? "en-US";
+    const result = await transcribeChunk(audioBuffer, participantName, primaryLang);
 
     // Save transcription
     await db
@@ -314,7 +297,7 @@ async function triggerTranscription(
       })
       .where(eq(transcriptions.id, txn.id));
 
-    // Save speaker segments — label with participant name
+    // Save speaker segments with participant name as label
     if (result.speakers.length > 0) {
       await db.insert(speakerSegments).values(
         result.speakers.map((seg) => ({
@@ -322,7 +305,7 @@ async function triggerTranscription(
           recordingId,
           participantId,
           speakerTag: seg.speakerTag,
-          speakerLabel: participantName ?? `Speaker ${seg.speakerTag}`,
+          speakerLabel: participantName,
           text: seg.text,
           startTimeMs: seg.startTimeMs,
           endTimeMs: seg.endTimeMs,
@@ -332,22 +315,6 @@ async function triggerTranscription(
           wordTimings: seg.words,
         })),
       );
-    } else if (result.fullText) {
-      // No diarization data but we have text — create a single segment
-      await db.insert(speakerSegments).values({
-        transcriptionId: txn.id,
-        recordingId,
-        participantId,
-        speakerTag: 0,
-        speakerLabel: participantName ?? "Speaker",
-        text: result.fullText,
-        startTimeMs: 0,
-        endTimeMs: 5000,
-        absoluteStartMs: audioStartMs,
-        languageCode: result.languageCode,
-        confidence: result.confidence,
-        wordTimings: [],
-      });
     }
 
     // Broadcast transcription result via WebSocket
@@ -366,9 +333,7 @@ async function triggerTranscription(
     await db
       .update(uploadWal)
       .set({ transcribed: true, updatedAt: new Date() })
-      .where(
-        and(eq(uploadWal.recordingId, recordingId), eq(uploadWal.chunkIndex, chunks.index as any)),
-      );
+      .where(and(eq(uploadWal.recordingId, recordingId)));
   } catch (err) {
     await db
       .update(transcriptions)

@@ -19,8 +19,10 @@
     "@hono/node-server": "^1.19.12",
     "@my-better-t-app/db": "*",
     "@my-better-t-app/env": "*",
+    "@vercel/blob": "^2.3.3",
     "dotenv": "^17.2.2",
     "hono": "^4.8.2",
+    "openai": "^6.33.0",
     "zod": "^4.1.13"
   },
   "devDependencies": {
