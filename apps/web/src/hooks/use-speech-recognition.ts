@@ -39,10 +39,19 @@ function getSpeechRecognition(): SpeechRecognitionConstructor | null {
       .webkitSpeechRecognition) as SpeechRecognitionConstructor | null;
 }
 
+/**
+ * Dual-instance speech recognition for zero-gap transcription.
+ *
+ * The Web Speech API drops audio during restarts (~200-500ms gap).
+ * To fix this, we run TWO recognition instances in overlap:
+ * - Instance A is the primary listener
+ * - When A ends (silence/timeout), Instance B is ALREADY running
+ * - B becomes primary, A restarts in background
+ * - This ensures there's always at least one instance listening
+ */
 export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) {
   const { language = "en-US", speakerLabel = "You" } = options;
 
-  // Use refs for segments to avoid stale closures in callbacks
   const segmentsRef = useRef<TranscriptSegment[]>([]);
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [interimText, setInterimText] = useState("");
@@ -50,13 +59,17 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
   const [isSupported, setIsSupported] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const recognitionRef = useRef<SpeechRecognitionType | null>(null);
+  // Two instances for overlap
+  const instanceARef = useRef<SpeechRecognitionType | null>(null);
+  const instanceBRef = useRef<SpeechRecognitionType | null>(null);
   const shouldBeListeningRef = useRef(false);
-  const restartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const languageRef = useRef(language);
   const speakerLabelRef = useRef(speakerLabel);
 
-  // Keep refs in sync
+  // Dedup: track recently added text to avoid duplicates from overlapping instances
+  const recentTextsRef = useRef<Set<string>>(new Set());
+  const cleanupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   languageRef.current = language;
   speakerLabelRef.current = speakerLabel;
 
@@ -65,6 +78,13 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
   }, []);
 
   const addSegment = useCallback((text: string) => {
+    // Dedup: skip if we just added this exact text in the last 3 seconds
+    const normalized = text.toLowerCase().trim();
+    if (recentTextsRef.current.has(normalized)) return;
+
+    recentTextsRef.current.add(normalized);
+    setTimeout(() => recentTextsRef.current.delete(normalized), 3000);
+
     const segment: TranscriptSegment = {
       id: crypto.randomUUID(),
       text,
@@ -74,90 +94,80 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
       speakerLabel: speakerLabelRef.current,
     };
     segmentsRef.current = [...segmentsRef.current, segment];
-    setSegments(segmentsRef.current);
+    setSegments([...segmentsRef.current]);
   }, []);
 
-  const createRecognition = useCallback(() => {
-    const SpeechRecognitionClass = getSpeechRecognition();
-    if (!SpeechRecognitionClass) return null;
+  const createInstance = useCallback(
+    (label: string): SpeechRecognitionType | null => {
+      const SpeechRecognitionClass = getSpeechRecognition();
+      if (!SpeechRecognitionClass) return null;
 
-    const recognition = new SpeechRecognitionClass();
-    recognition.lang = languageRef.current;
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
+      const recognition = new SpeechRecognitionClass();
+      recognition.lang = languageRef.current;
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.maxAlternatives = 1;
 
-    recognition.onstart = () => {
-      setIsListening(true);
-      setError(null);
-    };
+      recognition.onstart = () => {
+        setIsListening(true);
+        setError(null);
+      };
 
-    recognition.onresult = (event) => {
-      let interim = "";
+      recognition.onresult = (event) => {
+        let interim = "";
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const result = event.results[i];
+          if (!result?.[0]) continue;
+          const transcript = result[0].transcript;
 
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        if (!result?.[0]) continue;
-        const transcript = result[0].transcript;
-
-        if (result.isFinal && transcript.trim()) {
-          addSegment(transcript.trim());
-          setInterimText("");
-        } else {
-          interim += transcript;
-        }
-      }
-
-      if (interim) {
-        setInterimText(interim);
-      }
-    };
-
-    recognition.onerror = (event) => {
-      // "no-speech" and "aborted" are normal during restarts
-      if (event.error === "no-speech" || event.error === "aborted") return;
-      if (event.error === "not-allowed") {
-        setError("Microphone access denied. Allow microphone to enable transcription.");
-        shouldBeListeningRef.current = false;
-        return;
-      }
-      console.error("Speech recognition error:", event.error);
-    };
-
-    recognition.onend = () => {
-      setIsListening(false);
-      setInterimText("");
-
-      // CRITICAL: restart immediately to avoid gaps in transcription
-      // Web Speech API stops after ~60s or on silence — we must restart
-      if (shouldBeListeningRef.current) {
-        restartTimeoutRef.current = setTimeout(() => {
-          if (shouldBeListeningRef.current) {
-            const newRecognition = createRecognition();
-            if (newRecognition) {
-              recognitionRef.current = newRecognition;
-              try {
-                newRecognition.start();
-              } catch {
-                // retry once more after a short delay
-                setTimeout(() => {
-                  if (shouldBeListeningRef.current) {
-                    try {
-                      newRecognition.start();
-                    } catch {
-                      setError("Speech recognition stopped unexpectedly. Click Record to restart.");
-                    }
-                  }
-                }, 500);
-              }
-            }
+          if (result.isFinal && transcript.trim()) {
+            addSegment(transcript.trim());
+            setInterimText("");
+          } else {
+            interim += transcript;
           }
-        }, 50); // 50ms gap — minimal loss
-      }
-    };
+        }
+        if (interim) setInterimText(interim);
+      };
 
-    return recognition;
-  }, [addSegment]);
+      recognition.onerror = (event) => {
+        if (event.error === "no-speech" || event.error === "aborted") return;
+        if (event.error === "not-allowed") {
+          setError("Microphone access denied. Allow microphone to enable transcription.");
+          shouldBeListeningRef.current = false;
+          return;
+        }
+      };
+
+      recognition.onend = () => {
+        if (!shouldBeListeningRef.current) {
+          setIsListening(false);
+          return;
+        }
+
+        // Immediately restart this instance — the OTHER instance covers the gap
+        setTimeout(() => {
+          if (!shouldBeListeningRef.current) return;
+          try {
+            const newInstance = createInstance(label);
+            if (newInstance) {
+              if (label === "A") {
+                instanceARef.current = newInstance;
+              } else {
+                instanceBRef.current = newInstance;
+              }
+              newInstance.start();
+            }
+          } catch {
+            // Will retry on next end cycle
+          }
+        }, 0);
+      };
+
+      return recognition;
+    },
+    [addSegment],
+  );
 
   const startListening = useCallback(() => {
     if (!getSpeechRecognition()) {
@@ -166,43 +176,49 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
     }
 
     // Stop existing
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.abort();
-      } catch {
-        // ignore
+    [instanceARef, instanceBRef].forEach((ref) => {
+      if (ref.current) {
+        try {
+          ref.current.abort();
+        } catch {}
+        ref.current = null;
       }
-    }
-    if (restartTimeoutRef.current) {
-      clearTimeout(restartTimeoutRef.current);
-    }
+    });
 
     shouldBeListeningRef.current = true;
-    const recognition = createRecognition();
-    if (recognition) {
-      recognitionRef.current = recognition;
+
+    // Start instance A immediately
+    const a = createInstance("A");
+    if (a) {
+      instanceARef.current = a;
       try {
-        recognition.start();
-      } catch {
-        setError("Failed to start speech recognition.");
-      }
+        a.start();
+      } catch {}
     }
-  }, [createRecognition]);
+
+    // Start instance B after 500ms delay (offset so they overlap)
+    setTimeout(() => {
+      if (!shouldBeListeningRef.current) return;
+      const b = createInstance("B");
+      if (b) {
+        instanceBRef.current = b;
+        try {
+          b.start();
+        } catch {}
+      }
+    }, 500);
+  }, [createInstance]);
 
   const stopListening = useCallback(() => {
     shouldBeListeningRef.current = false;
-    if (restartTimeoutRef.current) {
-      clearTimeout(restartTimeoutRef.current);
-      restartTimeoutRef.current = null;
-    }
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        // ignore
+    [instanceARef, instanceBRef].forEach((ref) => {
+      if (ref.current) {
+        try {
+          ref.current.stop();
+        } catch {}
+        ref.current = null;
       }
-      recognitionRef.current = null;
-    }
+    });
     setIsListening(false);
     setInterimText("");
   }, []);
@@ -211,20 +227,20 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}) 
     segmentsRef.current = [];
     setSegments([]);
     setInterimText("");
+    recentTextsRef.current.clear();
   }, []);
 
-  // Cleanup
   useEffect(() => {
     return () => {
       shouldBeListeningRef.current = false;
-      if (restartTimeoutRef.current) clearTimeout(restartTimeoutRef.current);
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort();
-        } catch {
-          // ignore
+      [instanceARef, instanceBRef].forEach((ref) => {
+        if (ref.current) {
+          try {
+            ref.current.abort();
+          } catch {}
         }
-      }
+      });
+      if (cleanupTimerRef.current) clearTimeout(cleanupTimerRef.current);
     };
   }, []);
 

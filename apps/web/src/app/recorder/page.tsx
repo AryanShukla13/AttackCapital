@@ -133,7 +133,7 @@ export default function RecorderPage() {
   const speech = useMultiSpeaker({
     language: selectedLanguage,
     speakerCount,
-    silenceThresholdMs: 1500,
+    silenceThresholdMs: 600,
   });
 
   const isRecording = status === "recording";
