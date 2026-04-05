@@ -133,6 +133,7 @@ app.post("/upload", async (c) => {
 
   // --- TRANSCRIBE SYNCHRONOUSLY (critical for Vercel serverless) ---
   let transcriptionText: string | null = null;
+  let transcriptionError: string | null = null;
 
   if (chunk && process.env.OPENAI_API_KEY) {
     try {
@@ -205,6 +206,7 @@ app.post("/upload", async (c) => {
       }
     } catch (err) {
       console.error("Transcription failed:", err);
+      transcriptionError = err instanceof Error ? err.message : "Transcription failed";
       // Save failed transcription record
       if (chunk) {
         await db
@@ -214,14 +216,14 @@ app.post("/upload", async (c) => {
             recordingId,
             participantId,
             status: "failed",
-            error: err instanceof Error ? err.message : "Transcription failed",
+            error: transcriptionError,
           })
           .onConflictDoNothing();
       }
     }
   }
 
-  return c.json({ ...chunk, transcriptionText }, 201);
+  return c.json({ ...chunk, transcriptionText, transcriptionError }, 201);
 });
 
 // Acknowledge a chunk
