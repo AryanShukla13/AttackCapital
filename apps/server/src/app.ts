@@ -19,7 +19,14 @@ app.use(
 );
 
 app.get("/", (c) => c.text("OK"));
-app.get("/health", (c) => c.json({ status: "healthy", timestamp: new Date().toISOString() }));
+app.get("/health", (c) =>
+  c.json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    hasOpenAI: !!process.env.OPENAI_API_KEY,
+    hasDB: !!process.env.DATABASE_URL,
+  }),
+);
 
 app.route("/sessions", sessionsRoutes);
 app.route("/recordings", recordingsRoutes);
