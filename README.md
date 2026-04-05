@@ -78,9 +78,9 @@ export const options = {
   scenarios: {
     chunk_uploads: {
       executor: "constant-arrival-rate",
-      rate: 5000,           // 5,000 req/s
+      rate: 5000, // 5,000 req/s
       timeUnit: "1s",
-      duration: "1m",       // → 300K requests in 60s
+      duration: "1m", // → 300K requests in 60s
       preAllocatedVUs: 500,
       maxVUs: 1000,
     },
