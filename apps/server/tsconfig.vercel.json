@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "outDir": ".vercel/output"
+  },
+  "include": ["src/**/*.ts", "api/**/*.ts"],
+  "exclude": ["src/index.ts", "src/lib/ws.ts"]
+}

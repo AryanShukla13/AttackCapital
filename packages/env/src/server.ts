@@ -5,12 +5,13 @@ import { z } from "zod";
 export const env = createEnv({
   server: {
     DATABASE_URL: z.string().min(1),
-    CORS_ORIGIN: z.url(),
+    CORS_ORIGIN: z.string().default("*"),
     NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
-    GCS_BUCKET_NAME: z.string().min(1),
-    GCS_PROJECT_ID: z.string().min(1),
+    GCS_BUCKET_NAME: z.string().default(""),
+    GCS_PROJECT_ID: z.string().default(""),
     GCS_KEY_FILE: z.string().optional(),
   },
   runtimeEnv: process.env,
-  emptyStringAsUndefined: true,
+  emptyStringAsUndefined: false,
+  skipValidation: process.env.SKIP_ENV_VALIDATION === "1",
 });

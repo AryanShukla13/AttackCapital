@@ -1,10 +1,17 @@
-import speech from "@google-cloud/speech";
+import { SpeechClient } from "@google-cloud/speech";
 import { env } from "@my-better-t-app/env/server";
 
-const client = new speech.SpeechClient({
-  projectId: env.GCS_PROJECT_ID,
-  ...(env.GCS_KEY_FILE ? { keyFilename: env.GCS_KEY_FILE } : {}),
-});
+let _client: SpeechClient | null = null;
+
+function getClient(): SpeechClient {
+  if (!_client) {
+    _client = new SpeechClient({
+      projectId: env.GCS_PROJECT_ID,
+      ...(env.GCS_KEY_FILE ? { keyFilename: env.GCS_KEY_FILE } : {}),
+    });
+  }
+  return _client;
+}
 
 export interface SpeakerSegment {
   speakerTag: number;
@@ -39,7 +46,7 @@ export async function transcribeChunk(
   const primaryLanguage = languageCodes[0] ?? "en-US";
   const alternativeLanguages = languageCodes.slice(1);
 
-  const [operation] = await client.longRunningRecognize({
+  const [operation] = await getClient().longRunningRecognize({
     audio: { uri: gcsUri },
     config: {
       encoding: "LINEAR16" as const,

@@ -1,20 +1,19 @@
 /**
  * WebSocket manager for real-time session updates.
- * Each session has a set of connected WebSocket clients.
- * Broadcasts transcription results and chunk events to all participants in a session.
+ * In serverless (Vercel), WebSocket is unavailable — broadcasts are no-ops
+ * and clients fall back to HTTP polling (already implemented).
+ * In Bun (local dev / Cloud Run), full WebSocket support works.
  */
 
-import type { ServerWebSocket } from "bun";
-
-interface WsData {
-  sessionId: string;
-  participantId: string;
+interface WsLike {
+  send(data: string): void;
+  data: { sessionId: string; participantId: string };
 }
 
 // Session ID -> Set of WebSocket connections
-const sessionConnections = new Map<string, Set<ServerWebSocket<WsData>>>();
+const sessionConnections = new Map<string, Set<WsLike>>();
 
-export function addConnection(sessionId: string, ws: ServerWebSocket<WsData>): void {
+export function addConnection(sessionId: string, ws: WsLike): void {
   let connections = sessionConnections.get(sessionId);
   if (!connections) {
     connections = new Set();
@@ -23,7 +22,7 @@ export function addConnection(sessionId: string, ws: ServerWebSocket<WsData>): v
   connections.add(ws);
 }
 
-export function removeConnection(sessionId: string, ws: ServerWebSocket<WsData>): void {
+export function removeConnection(sessionId: string, ws: WsLike): void {
   const connections = sessionConnections.get(sessionId);
   if (connections) {
     connections.delete(ws);
@@ -53,12 +52,11 @@ export function getSessionConnectionCount(sessionId: string): number {
 
 /**
  * Set up WebSocket upgrade handler for Bun's native server.
- * Call this from the server entry point.
+ * Only used in Bun runtime (local dev / Cloud Run).
  */
 export function createWebSocketHandlers() {
   return {
-    message(ws: ServerWebSocket<WsData>, message: string | Buffer) {
-      // Handle ping/pong for keep-alive
+    message(ws: WsLike, message: string | Buffer) {
       try {
         const data = JSON.parse(message.toString());
         if (data.type === "ping") {
@@ -68,7 +66,7 @@ export function createWebSocketHandlers() {
         // Ignore malformed messages
       }
     },
-    open(ws: ServerWebSocket<WsData>) {
+    open(ws: WsLike) {
       const { sessionId } = ws.data;
       addConnection(sessionId, ws);
       broadcastToSession(sessionId, {
@@ -76,7 +74,7 @@ export function createWebSocketHandlers() {
         participantId: ws.data.participantId,
       });
     },
-    close(ws: ServerWebSocket<WsData>) {
+    close(ws: WsLike) {
       const { sessionId } = ws.data;
       removeConnection(sessionId, ws);
       broadcastToSession(sessionId, {

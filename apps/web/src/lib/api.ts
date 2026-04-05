@@ -1,6 +1,5 @@
-import { env } from "@my-better-t-app/env/web";
-
-const BASE_URL = env.NEXT_PUBLIC_SERVER_URL;
+// Use relative URLs — API routes are mounted at /api/* in the same Next.js app
+const BASE_URL = typeof window !== "undefined" ? "" : (process.env.NEXT_PUBLIC_SERVER_URL ?? "");
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE_URL}${path}`, {
