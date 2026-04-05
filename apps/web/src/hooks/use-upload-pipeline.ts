@@ -24,9 +24,12 @@ function delay(ms: number): Promise<void> {
 
 export function useUploadPipeline() {
   const [recordingId, setRecordingId] = useState<string | null>(null);
+  const [participantId, setParticipantId] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const [trackedChunks, setTrackedChunks] = useState<TrackedChunk[]>([]);
   const [isReconciling, setIsReconciling] = useState(false);
   const chunkIndexRef = useRef(0);
+  const recordingStartTimeRef = useRef<number>(0);
 
   const updateChunk = useCallback((localId: string, update: Partial<TrackedChunk>) => {
     setTrackedChunks((prev) =>
@@ -34,30 +37,52 @@ export function useUploadPipeline() {
     );
   }, []);
 
-  // Start a new recording session on the server
+  // Start a standalone recording session (no shared session)
   const startSession = useCallback(async (speakerCount?: number, languages?: string[]) => {
     const recording = await api.createRecording(speakerCount, languages);
     setRecordingId(recording.id);
+    setParticipantId(null);
+    setSessionId(null);
     setTrackedChunks([]);
     chunkIndexRef.current = 0;
+    recordingStartTimeRef.current = Date.now();
     return recording.id;
   }, []);
 
-  // Upload with automatic retry
+  // Start from an existing session (multi-participant)
+  const startFromSession = useCallback((recId: string, partId: string, sessId: string) => {
+    setRecordingId(recId);
+    setParticipantId(partId);
+    setSessionId(sessId);
+    setTrackedChunks([]);
+    chunkIndexRef.current = 0;
+    recordingStartTimeRef.current = Date.now();
+  }, []);
+
   async function uploadWithRetry(
-    sessionId: string,
+    sessionRecId: string,
     index: number,
     blob: Blob,
     durationMs: number,
     checksum: string,
     idempotencyKey: string,
+    partId?: string,
+    audioStartedAt?: number,
     maxRetries: number = MAX_RETRIES,
   ): Promise<api.Chunk> {
     let lastError: Error | undefined;
-
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        return await api.uploadChunk(sessionId, index, blob, durationMs, checksum, idempotencyKey);
+        return await api.uploadChunk(
+          sessionRecId,
+          index,
+          blob,
+          durationMs,
+          checksum,
+          idempotencyKey,
+          partId,
+          audioStartedAt,
+        );
       } catch (err) {
         lastError = err instanceof Error ? err : new Error("Upload failed");
         if (attempt < maxRetries) {
@@ -65,15 +90,14 @@ export function useUploadPipeline() {
         }
       }
     }
-
     throw lastError;
   }
 
-  // Process a single chunk: OPFS save -> upload -> ack
   const processChunk = useCallback(
-    async (chunk: WavChunk, sessionId: string) => {
+    async (chunk: WavChunk, sessionRecId: string) => {
       const index = chunkIndexRef.current++;
-      const idempotencyKey = `${sessionId}-${index}-${chunk.id}`;
+      const idempotencyKey = `${sessionRecId}-${index}-${chunk.id}`;
+      const audioStartedAt = recordingStartTimeRef.current + index * 5000; // approximate
       const tracked: TrackedChunk = {
         localId: chunk.id,
         index,
@@ -84,45 +108,38 @@ export function useUploadPipeline() {
       setTrackedChunks((prev) => [...prev, tracked]);
 
       try {
-        // 1. Save to OPFS for durability
-        await saveChunkToOPFS(sessionId, index, chunk.blob);
+        await saveChunkToOPFS(sessionRecId, index, chunk.blob);
         updateChunk(chunk.id, { uploadStatus: "uploading" });
 
-        // 2. Compute checksum
         const checksum = await computeChecksum(chunk.blob);
-
-        // 3. Upload to server with retry (idempotent)
         const durationMs = Math.round(chunk.duration * 1000);
         const serverChunk = await uploadWithRetry(
-          sessionId,
+          sessionRecId,
           index,
           chunk.blob,
           durationMs,
           checksum,
           idempotencyKey,
+          participantId ?? undefined,
+          audioStartedAt,
         );
         updateChunk(chunk.id, { uploadStatus: "acknowledged", serverChunkId: serverChunk.id });
 
-        // 4. Acknowledge
         await api.acknowledgeChunk(serverChunk.id);
-
-        // 5. Remove from OPFS (uploaded and acked)
-        await removeChunkFromOPFS(sessionId, index);
+        await removeChunkFromOPFS(sessionRecId, index);
       } catch (err) {
         const message = err instanceof Error ? err.message : "Upload failed";
         updateChunk(chunk.id, { uploadStatus: "failed", error: message });
       }
     },
-    [updateChunk],
+    [updateChunk, participantId],
   );
 
-  // Complete the recording session
   const completeSession = useCallback(async () => {
     if (!recordingId) return;
     await api.completeRecording(recordingId);
   }, [recordingId]);
 
-  // Reconcile: find chunks missing from GCS and re-upload from OPFS
   const reconcile = useCallback(async () => {
     if (!recordingId) return;
     setIsReconciling(true);
@@ -140,6 +157,7 @@ export function useUploadPipeline() {
         const checksum = await computeChecksum(blob);
         const durationMs = 5000;
         const idempotencyKey = `${recordingId}-${missing.index}-reconcile`;
+        const audioStartedAt = recordingStartTimeRef.current + missing.index * 5000;
         const serverChunk = await uploadWithRetry(
           recordingId,
           missing.index,
@@ -147,6 +165,8 @@ export function useUploadPipeline() {
           durationMs,
           checksum,
           idempotencyKey,
+          participantId ?? undefined,
+          audioStartedAt,
         );
         await api.acknowledgeChunk(serverChunk.id);
         await removeChunkFromOPFS(recordingId, missing.index);
@@ -167,9 +187,8 @@ export function useUploadPipeline() {
     } finally {
       setIsReconciling(false);
     }
-  }, [recordingId]);
+  }, [recordingId, participantId]);
 
-  // Retry a single failed chunk from OPFS
   const retryChunk = useCallback(
     async (localId: string) => {
       if (!recordingId) return;
@@ -191,6 +210,7 @@ export function useUploadPipeline() {
         const checksum = await computeChecksum(blob);
         const durationMs = 5000;
         const idempotencyKey = `${recordingId}-${tracked.index}-retry-${newRetryCount}`;
+        const audioStartedAt = recordingStartTimeRef.current + tracked.index * 5000;
         const serverChunk = await uploadWithRetry(
           recordingId,
           tracked.index,
@@ -198,6 +218,8 @@ export function useUploadPipeline() {
           durationMs,
           checksum,
           idempotencyKey,
+          participantId ?? undefined,
+          audioStartedAt,
         );
         await api.acknowledgeChunk(serverChunk.id);
         await removeChunkFromOPFS(recordingId, tracked.index);
@@ -207,14 +229,17 @@ export function useUploadPipeline() {
         updateChunk(localId, { uploadStatus: "failed", error: message });
       }
     },
-    [recordingId, trackedChunks, updateChunk],
+    [recordingId, trackedChunks, updateChunk, participantId],
   );
 
   return {
     recordingId,
+    participantId,
+    sessionId,
     trackedChunks,
     isReconciling,
     startSession,
+    startFromSession,
     processChunk,
     completeSession,
     reconcile,

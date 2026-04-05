@@ -5,9 +5,7 @@ const BASE_URL = env.NEXT_PUBLIC_SERVER_URL;
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE_URL}${path}`, {
     ...init,
-    headers: {
-      ...init?.headers,
-    },
+    headers: { ...init?.headers },
   });
 
   if (!res.ok) {
@@ -18,8 +16,34 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// --- Types ---
+
+export interface Session {
+  id: string;
+  code: string;
+  name: string | null;
+  status: string;
+  hostParticipantId: string | null;
+  maxParticipants: number;
+  languageCodes: string[];
+  createdAt: string;
+  completedAt: string | null;
+}
+
+export interface Participant {
+  id: string;
+  sessionId: string;
+  name: string;
+  deviceId: string | null;
+  isActive: boolean;
+  joinedAt: string;
+  leftAt: string | null;
+}
+
 export interface Recording {
   id: string;
+  sessionId: string | null;
+  participantId: string | null;
   status: string;
   totalChunks: number;
   sampleRate: number;
@@ -32,6 +56,7 @@ export interface Recording {
 export interface Chunk {
   id: string;
   recordingId: string;
+  participantId: string | null;
   index: number;
   duration: number;
   gcsPath: string | null;
@@ -46,11 +71,13 @@ export interface SpeakerSegment {
   id: string;
   transcriptionId: string;
   recordingId: string;
+  participantId: string | null;
   speakerTag: number;
   speakerLabel: string | null;
   text: string;
   startTimeMs: number;
   endTimeMs: number;
+  absoluteStartMs: number | null;
   languageCode: string | null;
   confidence: number | null;
   wordTimings: Array<{ word: string; startMs: number; endMs: number; confidence: number }>;
@@ -64,16 +91,68 @@ export interface TranscriptionStatus {
 }
 
 export interface TranscriptionResponse {
-  recordingId: string;
+  recordingId?: string;
+  sessionId?: string;
   status: TranscriptionStatus;
   speakers: Array<{
-    tag: number;
+    tag?: number;
+    participantId?: string | null;
     label: string;
     languages: string[];
     segmentCount: number;
   }>;
   fullTranscript: string;
   segments: SpeakerSegment[];
+  participants?: Participant[];
+}
+
+export interface JoinResult {
+  session: Session;
+  participant: Participant;
+  recording: Recording;
+  reconnected: boolean;
+}
+
+// --- Sessions ---
+
+export async function createSession(
+  name?: string,
+  languages?: string[],
+  maxParticipants?: number,
+): Promise<Session> {
+  return request("/api/sessions/create", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, languages, maxParticipants }),
+  });
+}
+
+export async function joinSession(
+  code: string,
+  name: string,
+  deviceId?: string,
+): Promise<JoinResult> {
+  return request("/api/sessions/join", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code, name, deviceId }),
+  });
+}
+
+export async function leaveSession(participantId: string): Promise<void> {
+  await request("/api/sessions/leave", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ participantId }),
+  });
+}
+
+export async function getSession(id: string): Promise<Session & { participants: Participant[] }> {
+  return request(`/api/sessions/${id}`);
+}
+
+export async function completeSession(id: string): Promise<Session> {
+  return request(`/api/sessions/${id}/complete`, { method: "PATCH" });
 }
 
 // --- Recordings ---
@@ -93,10 +172,6 @@ export async function completeRecording(id: string): Promise<Recording> {
   return request(`/api/recordings/${id}/complete`, { method: "PATCH" });
 }
 
-export async function getRecording(id: string): Promise<Recording & { chunks: Chunk[] }> {
-  return request(`/api/recordings/${id}`);
-}
-
 // --- Chunks ---
 
 export async function uploadChunk(
@@ -106,6 +181,8 @@ export async function uploadChunk(
   durationMs: number,
   checksum: string,
   idempotencyKey?: string,
+  participantId?: string,
+  audioStartedAt?: number,
 ): Promise<Chunk> {
   const formData = new FormData();
   formData.append("file", blob, `chunk-${chunkIndex}.wav`);
@@ -113,9 +190,9 @@ export async function uploadChunk(
   formData.append("chunkIndex", String(chunkIndex));
   formData.append("durationMs", String(durationMs));
   formData.append("checksum", checksum);
-  if (idempotencyKey) {
-    formData.append("idempotencyKey", idempotencyKey);
-  }
+  if (idempotencyKey) formData.append("idempotencyKey", idempotencyKey);
+  if (participantId) formData.append("participantId", participantId);
+  if (audioStartedAt) formData.append("audioStartedAt", String(audioStartedAt));
 
   return request("/api/chunks/upload", { method: "POST", body: formData });
 }
@@ -124,13 +201,11 @@ export async function acknowledgeChunk(chunkId: string): Promise<Chunk> {
   return request(`/api/chunks/${chunkId}/ack`, { method: "PATCH" });
 }
 
-export interface ReconcileResult {
+export async function reconcileRecording(recordingId: string): Promise<{
   recordingId: string;
   missing: Array<{ chunkId: string; index: number }>;
   total: number;
-}
-
-export async function reconcileRecording(recordingId: string): Promise<ReconcileResult> {
+}> {
   return request(`/api/chunks/reconcile/${recordingId}`, { method: "POST" });
 }
 
@@ -140,13 +215,6 @@ export async function getTranscriptions(recordingId: string): Promise<Transcript
   return request(`/api/transcriptions/${recordingId}`);
 }
 
-export async function setRecordingLanguages(
-  recordingId: string,
-  languages: string[],
-): Promise<Recording> {
-  return request(`/api/transcriptions/languages/${recordingId}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ languages }),
-  });
+export async function getSessionTranscriptions(sessionId: string): Promise<TranscriptionResponse> {
+  return request(`/api/transcriptions/session/${sessionId}`);
 }
