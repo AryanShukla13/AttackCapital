@@ -3,16 +3,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
-  Check,
   Copy,
   Globe,
   Loader2,
   LogOut,
   MessageSquare,
   Mic,
+  MicOff,
   Pause,
   Play,
-  RefreshCw,
   Square,
   Users,
   Wifi,
@@ -33,6 +32,7 @@ import { LiveWaveform } from "@/components/ui/live-waveform";
 import { useRecorder } from "@/hooks/use-recorder";
 import { useUploadPipeline } from "@/hooks/use-upload-pipeline";
 import { useSessionWs } from "@/hooks/use-session-ws";
+import { useSpeechRecognition } from "@/hooks/use-speech-recognition";
 import * as api from "@/lib/api";
 
 const LANGUAGE_OPTIONS = [
@@ -85,7 +85,7 @@ export default function SessionPage() {
   const [userName, setUserName] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [sessionName, setSessionName] = useState("");
-  const [selectedLanguages, setSelectedLanguages] = useState<string[]>(["en-US"]);
+  const [selectedLanguage, setSelectedLanguage] = useState("en-US");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -94,51 +94,22 @@ export default function SessionPage() {
   const [participant, setParticipant] = useState<api.Participant | null>(null);
   const [sessionParticipants, setSessionParticipants] = useState<api.Participant[]>([]);
 
-  // Transcription state
-  const [transcription, setTranscription] = useState<api.TranscriptionResponse | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
   // Recorder + pipeline
-  const { status, start, stop, pause, resume, chunks, elapsed, stream } = useRecorder({
-    chunkDuration: 5,
-  });
+  const { status, start, stop, pause, resume, elapsed, stream } = useRecorder({ chunkDuration: 5 });
   const pipeline = useUploadPipeline();
-  const prevChunkCountRef = useRef(0);
 
   // WebSocket
   const { messages, isConnected } = useSessionWs(session?.id ?? null, participant?.id ?? null);
 
+  // Real-time speech recognition (free, browser-based)
+  const speech = useSpeechRecognition({
+    language: selectedLanguage,
+    speakerLabel: userName || "You",
+  });
+
   const isRecording = status === "recording";
   const isPaused = status === "paused";
   const isActive = isRecording || isPaused;
-
-  // Auto-upload chunks
-  useEffect(() => {
-    if (chunks.length > prevChunkCountRef.current && pipeline.recordingId) {
-      const newChunks = chunks.slice(prevChunkCountRef.current);
-      for (const chunk of newChunks) {
-        pipeline.processChunk(chunk, pipeline.recordingId);
-      }
-    }
-    prevChunkCountRef.current = chunks.length;
-  }, [chunks, pipeline]);
-
-  // Poll transcription for session
-  useEffect(() => {
-    if (session?.id && pipeline.trackedChunks.some((tc) => tc.uploadStatus === "acknowledged")) {
-      const poll = () => {
-        api
-          .getSessionTranscriptions(session.id)
-          .then(setTranscription)
-          .catch(() => {});
-      };
-      poll();
-      pollRef.current = setInterval(poll, 2000);
-      return () => {
-        if (pollRef.current) clearInterval(pollRef.current);
-      };
-    }
-  }, [session?.id, pipeline.trackedChunks]);
 
   // Handle WebSocket messages — update participant list
   useEffect(() => {
@@ -150,17 +121,9 @@ export default function SessionPage() {
           .then((s) => setSessionParticipants(s.participants))
           .catch(() => {});
       }
-      if (msg.type === "transcription_ready") {
-        // Refresh transcription
-        api
-          .getSessionTranscriptions(session.id)
-          .then(setTranscription)
-          .catch(() => {});
-      }
     }
   }, [messages, session?.id]);
 
-  // Generate a persistent device ID
   const getDeviceId = useCallback((): string => {
     let id = localStorage.getItem("swades-device-id");
     if (!id) {
@@ -175,7 +138,7 @@ export default function SessionPage() {
     setIsLoading(true);
     setError(null);
     try {
-      const sess = await api.createSession(sessionName || undefined, selectedLanguages);
+      const sess = await api.createSession(sessionName || undefined, [selectedLanguage]);
       const result = await api.joinSession(sess.code, userName, getDeviceId());
       setSession(result.session);
       setParticipant(result.participant);
@@ -203,7 +166,6 @@ export default function SessionPage() {
       setSession(result.session);
       setParticipant(result.participant);
       pipeline.startFromSession(result.recording.id, result.participant.id, result.session.id);
-      // Fetch all participants
       const sess = await api.getSession(result.session.id);
       setSessionParticipants(sess.participants);
       setMode("recording");
@@ -219,48 +181,41 @@ export default function SessionPage() {
     }
   };
 
-  const handleRecord = useCallback(async () => {
+  const handleRecord = useCallback(() => {
     if (isActive) {
       stop();
-      await pipeline.completeSession();
-      // Final transcript
-      if (session?.id) {
-        setTimeout(() => {
-          api
-            .getSessionTranscriptions(session.id)
-            .then(setTranscription)
-            .catch(() => {});
-        }, 3000);
-      }
+      speech.stopListening();
     } else {
-      prevChunkCountRef.current = 0;
+      speech.clearTranscript();
       start();
+      speech.startListening();
     }
-  }, [isActive, stop, start, pipeline, session?.id]);
+  }, [isActive, stop, start, speech]);
+
+  const handlePause = useCallback(() => {
+    if (isPaused) {
+      resume();
+      speech.startListening();
+    } else {
+      pause();
+      speech.stopListening();
+    }
+  }, [isPaused, resume, pause, speech]);
 
   const handleLeave = async () => {
-    if (isActive) stop();
-    if (participant) await api.leaveSession(participant.id);
+    if (isActive) {
+      stop();
+      speech.stopListening();
+    }
+    if (participant) await api.leaveSession(participant.id).catch(() => {});
     setMode("lobby");
     setSession(null);
     setParticipant(null);
-    setTranscription(null);
   };
 
   const copyCode = () => {
     if (session?.code) navigator.clipboard.writeText(session.code);
   };
-
-  const toggleLanguage = (code: string) => {
-    setSelectedLanguages((prev) =>
-      prev.includes(code) ? prev.filter((l) => l !== code) : [...prev, code],
-    );
-  };
-
-  const ackedCount = pipeline.trackedChunks.filter(
-    (tc) => tc.uploadStatus === "acknowledged",
-  ).length;
-  const failedCount = pipeline.trackedChunks.filter((tc) => tc.uploadStatus === "failed").length;
 
   // ======= LOBBY =======
   if (mode === "lobby") {
@@ -277,7 +232,6 @@ export default function SessionPage() {
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
-            {/* Tab toggle */}
             <div className="flex gap-2">
               <Button
                 variant={tab === "create" ? "default" : "outline"}
@@ -295,7 +249,6 @@ export default function SessionPage() {
               </Button>
             </div>
 
-            {/* Name input */}
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="name">Your name</Label>
               <Input
@@ -321,16 +274,16 @@ export default function SessionPage() {
                 <div className="flex flex-col gap-2">
                   <Label className="flex items-center gap-1.5">
                     <Globe className="size-3.5" />
-                    Languages
+                    Language
                   </Label>
                   <div className="flex flex-wrap gap-1.5">
                     {LANGUAGE_OPTIONS.map((lang) => (
                       <button
                         key={lang.code}
                         type="button"
-                        onClick={() => toggleLanguage(lang.code)}
+                        onClick={() => setSelectedLanguage(lang.code)}
                         className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${
-                          selectedLanguages.includes(lang.code)
+                          selectedLanguage === lang.code
                             ? "border-primary bg-primary/10 text-primary"
                             : "border-border text-muted-foreground hover:bg-muted"
                         }`}
@@ -397,7 +350,7 @@ export default function SessionPage() {
   // ======= RECORDING MODE =======
   return (
     <div className="container mx-auto flex max-w-2xl flex-col items-center gap-6 px-4 py-8">
-      {/* Session info bar */}
+      {/* Session info */}
       <Card className="w-full">
         <CardHeader>
           <div className="flex items-center justify-between">
@@ -453,7 +406,9 @@ export default function SessionPage() {
       <Card className="w-full">
         <CardHeader>
           <CardTitle>Recording as {participant?.name}</CardTitle>
-          <CardDescription>Your audio is uploaded and transcribed automatically</CardDescription>
+          <CardDescription>
+            Live transcription powered by browser Speech Recognition (free)
+          </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-6">
           <div className="overflow-hidden rounded-sm border border-border/50 bg-muted/20 text-foreground">
@@ -473,24 +428,17 @@ export default function SessionPage() {
             />
           </div>
 
-          <div className="text-center font-mono text-3xl tabular-nums tracking-tight">
-            {formatTime(elapsed)}
-          </div>
-
-          {pipeline.trackedChunks.length > 0 && (
-            <div className="flex items-center justify-center gap-4 text-xs text-muted-foreground">
-              <span className="flex items-center gap-1">
-                <Check className="size-3 text-green-500" />
-                {ackedCount} uploaded
-              </span>
-              {failedCount > 0 && (
-                <span className="flex items-center gap-1">
-                  <AlertTriangle className="size-3 text-red-500" />
-                  {failedCount} failed
-                </span>
-              )}
+          <div className="flex flex-col items-center gap-1">
+            <div className="text-center font-mono text-3xl tabular-nums tracking-tight">
+              {formatTime(elapsed)}
             </div>
-          )}
+            {speech.isListening && (
+              <div className="flex items-center gap-1.5 text-xs text-green-500">
+                <Mic className="size-3 animate-pulse" />
+                Transcribing live...
+              </div>
+            )}
+          </div>
 
           <div className="flex items-center justify-center gap-3">
             <Button
@@ -514,12 +462,7 @@ export default function SessionPage() {
             </Button>
 
             {isActive && (
-              <Button
-                size="lg"
-                variant="outline"
-                className="gap-2"
-                onClick={isPaused ? resume : pause}
-              >
+              <Button size="lg" variant="outline" className="gap-2" onClick={handlePause}>
                 {isPaused ? (
                   <>
                     <Play className="size-4" />
@@ -533,79 +476,91 @@ export default function SessionPage() {
                 )}
               </Button>
             )}
-
-            {!isActive && failedCount > 0 && (
-              <Button
-                size="lg"
-                variant="outline"
-                className="gap-2"
-                onClick={pipeline.reconcile}
-                disabled={pipeline.isReconciling}
-              >
-                <RefreshCw className={`size-4 ${pipeline.isReconciling ? "animate-spin" : ""}`} />
-                Reconcile
-              </Button>
-            )}
           </div>
         </CardContent>
       </Card>
 
-      {/* Merged Transcription (all participants) */}
-      {transcription && (
-        <Card className="w-full">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <MessageSquare className="size-4" />
-              Live Transcript
-            </CardTitle>
-            <CardDescription>
-              {transcription.speakers?.length ?? 0} speaker(s) — {transcription.status.completed}/
-              {transcription.status.total} chunks transcribed
-              {transcription.status.processing > 0 &&
-                ` (${transcription.status.processing} processing)`}
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            {transcription.segments.length > 0 ? (
-              <div className="flex max-h-96 flex-col gap-3 overflow-y-auto rounded-sm border border-border/50 bg-muted/10 p-4">
-                {transcription.segments.map((seg, i) => (
-                  <div key={seg.id} className="flex gap-3">
-                    <div className="flex min-w-[80px] flex-col items-end">
-                      <span
-                        className={`text-xs font-semibold ${speakerColor(
-                          sessionParticipants.findIndex((p) => p.id === seg.participantId),
-                        )}`}
-                      >
-                        {seg.speakerLabel ?? "Unknown"}
-                      </span>
-                      {seg.languageCode && (
-                        <span className="text-[10px] text-muted-foreground">
-                          {seg.languageCode}
-                        </span>
-                      )}
-                    </div>
-                    <p className="flex-1 text-sm leading-relaxed">{seg.text}</p>
-                    {seg.confidence != null && (
-                      <span className="text-[10px] text-muted-foreground tabular-nums">
-                        {(seg.confidence * 100).toFixed(0)}%
-                      </span>
-                    )}
-                  </div>
-                ))}
-              </div>
-            ) : transcription.status.processing > 0 ? (
-              <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
-                <Loader2 className="size-4 animate-spin" />
-                Transcribing audio from all participants...
-              </div>
-            ) : (
-              <p className="py-4 text-center text-sm text-muted-foreground">
-                Start recording to see live transcription from all participants
-              </p>
+      {/* Live Transcription */}
+      <Card className="w-full">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <MessageSquare className="size-4" />
+            Live Transcript
+            {speech.isListening && (
+              <span className="flex items-center gap-1 rounded-full bg-green-500/10 px-2 py-0.5 text-[10px] font-normal text-green-500">
+                <span className="size-1.5 animate-pulse rounded-full bg-green-500" />
+                LIVE
+              </span>
             )}
-          </CardContent>
-        </Card>
-      )}
+          </CardTitle>
+          <CardDescription>
+            {speech.segments.length} segment(s) from {participant?.name ?? "you"}
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {speech.error ? (
+            <div className="flex items-center gap-2 rounded-sm border border-red-500/30 bg-red-500/10 px-3 py-3 text-sm text-red-400">
+              <MicOff className="size-4 shrink-0" />
+              {speech.error}
+            </div>
+          ) : speech.segments.length > 0 || speech.interimText ? (
+            <div className="flex max-h-96 flex-col gap-2 overflow-y-auto rounded-sm border border-border/50 bg-muted/10 p-4">
+              {speech.segments.map((seg) => (
+                <div key={seg.id} className="flex gap-3">
+                  <span
+                    className={`min-w-[60px] text-right text-xs font-semibold ${speakerColor(0)}`}
+                  >
+                    {seg.speakerLabel}
+                  </span>
+                  <p className="flex-1 text-sm leading-relaxed">{seg.text}</p>
+                  <span className="text-[10px] text-muted-foreground tabular-nums">
+                    {new Date(seg.timestamp).toLocaleTimeString([], {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                      second: "2-digit",
+                    })}
+                  </span>
+                </div>
+              ))}
+              {speech.interimText && (
+                <div className="flex gap-3 opacity-50">
+                  <span
+                    className={`min-w-[60px] text-right text-xs font-semibold ${speakerColor(0)}`}
+                  >
+                    ...
+                  </span>
+                  <p className="flex-1 text-sm italic leading-relaxed">{speech.interimText}</p>
+                </div>
+              )}
+            </div>
+          ) : isActive ? (
+            <p className="py-6 text-center text-sm text-muted-foreground">
+              Speak now — transcription appears in real-time...
+            </p>
+          ) : (
+            <p className="py-6 text-center text-sm text-muted-foreground">
+              Press Record and start speaking
+            </p>
+          )}
+
+          {!isActive && speech.fullText && (
+            <div className="mt-4 border-t border-border/50 pt-4">
+              <div className="flex items-center justify-between">
+                <h4 className="text-xs font-semibold text-muted-foreground">Full Transcript</h4>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="gap-1 text-xs"
+                  onClick={() => navigator.clipboard.writeText(speech.fullText)}
+                >
+                  Copy
+                </Button>
+              </div>
+              <p className="mt-2 text-sm leading-relaxed">{speech.fullText}</p>
+            </div>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }
