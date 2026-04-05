@@ -24,10 +24,9 @@ import {
 } from "@my-better-t-app/ui/components/card";
 import { LiveWaveform } from "@/components/ui/live-waveform";
 import { useRecorder, type WavChunk } from "@/hooks/use-recorder";
-import * as api from "@/lib/api";
 import { computeChecksum } from "@/lib/checksum";
 
-const LANGUAGE_OPTIONS = [
+const LANGUAGES = [
   { code: "en-US", label: "English (US)" },
   { code: "hi-IN", label: "Hindi" },
   { code: "es-ES", label: "Spanish" },
@@ -39,16 +38,12 @@ const LANGUAGE_OPTIONS = [
   { code: "ar-SA", label: "Arabic" },
   { code: "pt-BR", label: "Portuguese" },
   { code: "ru-RU", label: "Russian" },
-  { code: "it-IT", label: "Italian" },
   { code: "bn-IN", label: "Bengali" },
   { code: "ta-IN", label: "Tamil" },
 ];
 
-function formatTime(seconds: number) {
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  const ms = Math.floor((seconds % 1) * 10);
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${ms}`;
+function formatTime(s: number) {
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}.${Math.floor((s % 1) * 10)}`;
 }
 
 export default function RecorderPage() {
@@ -56,98 +51,135 @@ export default function RecorderPage() {
     chunkDuration: 5,
   });
 
-  const [selectedLanguage, setSelectedLanguage] = useState("en-US");
+  const [lang, setLang] = useState("en-US");
   const [hasRecorded, setHasRecorded] = useState(false);
 
-  // Server state
   const recordingIdRef = useRef<string | null>(null);
   const chunkIndexRef = useRef(0);
-  const processedChunkIdsRef = useRef<Set<string>>(new Set());
+  const sentChunksRef = useRef<Set<string>>(new Set());
 
-  // Transcript state
-  const [transcripts, setTranscripts] = useState<Map<number, string>>(new Map());
-  const [processingCount, setProcessingCount] = useState(0);
+  // Transcripts: index -> text
+  const [transcripts, setTranscripts] = useState<Record<number, string>>({});
+  const allDoneRef = useRef(false);
 
   const isRecording = status === "recording";
   const isPaused = status === "paused";
   const isActive = isRecording || isPaused;
 
-  // Upload and transcribe a single chunk
-  const uploadChunk = useCallback(async (chunk: WavChunk, index: number, recId: string) => {
-    setProcessingCount((c) => c + 1);
+  // Upload chunk — fast, no waiting for transcription
+  const sendChunk = useCallback(async (chunk: WavChunk, index: number, recId: string) => {
     try {
       const checksum = await computeChecksum(chunk.blob);
-      const durationMs = Math.round(chunk.duration * 1000);
-      const result = await api.uploadChunk(recId, index, chunk.blob, durationMs, checksum);
+      const formData = new FormData();
+      formData.append("file", chunk.blob, `chunk-${index}.wav`);
+      formData.append("recordingId", recId);
+      formData.append("chunkIndex", String(index));
+      formData.append("durationMs", String(Math.round(chunk.duration * 1000)));
+      formData.append("checksum", checksum);
 
-      // Get transcript from response
-      const resultAny = result as unknown as Record<string, unknown>;
-      const text = resultAny.transcriptionText as string | undefined;
-      if (text) {
-        setTranscripts((prev) => new Map(prev).set(index, text));
-      }
-
-      // Acknowledge
-      await api.acknowledgeChunk(result.id).catch(() => {});
+      await fetch("/api/chunks/upload", { method: "POST", body: formData });
     } catch (err) {
-      console.error(`Chunk ${index} failed:`, err);
-    } finally {
-      setProcessingCount((c) => c - 1);
+      console.error(`Upload chunk ${index} failed:`, err);
     }
   }, []);
 
-  // Watch for new chunks and upload them
+  // Watch for new chunks → upload immediately
   useEffect(() => {
-    if (!recordingIdRef.current) return;
+    const recId = recordingIdRef.current;
+    if (!recId) return;
 
     for (const chunk of chunks) {
-      if (processedChunkIdsRef.current.has(chunk.id)) continue;
-      processedChunkIdsRef.current.add(chunk.id);
-
-      const index = chunkIndexRef.current++;
-      uploadChunk(chunk, index, recordingIdRef.current);
+      if (sentChunksRef.current.has(chunk.id)) continue;
+      sentChunksRef.current.add(chunk.id);
+      const idx = chunkIndexRef.current++;
+      sendChunk(chunk, idx, recId);
     }
-  }, [chunks, uploadChunk]);
+  }, [chunks, sendChunk]);
 
-  const handleRecord = useCallback(async () => {
+  // Poll for transcripts every 3 seconds
+  useEffect(() => {
+    const recId = recordingIdRef.current;
+    if (!recId || !hasRecorded) return;
+    if (allDoneRef.current) return;
+
+    const poll = async () => {
+      try {
+        const res = await fetch(`/api/chunks/recording/${recId}`);
+        if (!res.ok) return;
+        const data = (await res.json()) as Array<{
+          index: number;
+          transcript: string | null;
+          transcriptionStatus: string;
+        }>;
+
+        const newTranscripts: Record<number, string> = {};
+        let allDone = true;
+        for (const item of data) {
+          if (item.transcript) {
+            newTranscripts[item.index] = item.transcript;
+          } else {
+            allDone = false;
+          }
+        }
+
+        setTranscripts((prev) => ({ ...prev, ...newTranscripts }));
+
+        if (allDone && data.length > 0 && !isActive) {
+          allDoneRef.current = true;
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    const interval = setInterval(poll, 3000);
+    poll(); // initial fetch
+    return () => clearInterval(interval);
+  }, [hasRecorded, isActive]);
+
+  const handleRecord = useCallback(() => {
     if (isActive) {
       stop();
       if (recordingIdRef.current) {
-        api.completeRecording(recordingIdRef.current).catch(() => {});
+        fetch(`/api/recordings/${recordingIdRef.current}/complete`, { method: "PATCH" }).catch(
+          () => {},
+        );
       }
     } else {
-      // Reset state
+      // Reset
       setHasRecorded(true);
-      setTranscripts(new Map());
-      setProcessingCount(0);
+      setTranscripts({});
       chunkIndexRef.current = 0;
-      processedChunkIdsRef.current.clear();
+      sentChunksRef.current.clear();
+      allDoneRef.current = false;
       recordingIdRef.current = null;
 
-      // Start recording FIRST (microphone access)
+      // Start mic FIRST
       start();
 
-      // Create server session in background
-      api
-        .createRecording(1, [selectedLanguage])
-        .then((rec) => {
-          recordingIdRef.current = rec.id;
+      // Create server recording in background
+      fetch("/api/recordings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ speakerCount: 1, languages: [lang] }),
+      })
+        .then((r) => r.json())
+        .then((data: { id: string }) => {
+          recordingIdRef.current = data.id;
         })
-        .catch(() => {
-          // Server unavailable — recording still works locally
-        });
+        .catch(() => {});
     }
-  }, [isActive, stop, start, selectedLanguage]);
+  }, [isActive, stop, start, lang]);
 
-  // Full transcript
-  const fullTranscript = Array.from(transcripts.entries())
-    .sort(([a], [b]) => a - b)
+  const transcriptCount = Object.keys(transcripts).length;
+  const fullTranscript = Object.entries(transcripts)
+    .sort(([a], [b]) => Number(a) - Number(b))
     .map(([, text]) => text)
     .join(" ");
 
   return (
     <div className="container mx-auto flex max-w-2xl flex-col items-center gap-6 px-4 py-8">
-      {/* Language selector — before first recording */}
+      {/* Language */}
       {!hasRecorded && (
         <Card className="w-full">
           <CardHeader>
@@ -158,18 +190,18 @@ export default function RecorderPage() {
           </CardHeader>
           <CardContent>
             <div className="flex flex-wrap gap-1.5">
-              {LANGUAGE_OPTIONS.map((lang) => (
+              {LANGUAGES.map((l) => (
                 <button
-                  key={lang.code}
+                  key={l.code}
                   type="button"
-                  onClick={() => setSelectedLanguage(lang.code)}
+                  onClick={() => setLang(l.code)}
                   className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${
-                    selectedLanguage === lang.code
+                    lang === l.code
                       ? "border-primary bg-primary/10 text-primary"
                       : "border-border text-muted-foreground hover:bg-muted"
                   }`}
                 >
-                  {lang.label}
+                  {l.label}
                 </button>
               ))}
             </div>
@@ -208,11 +240,11 @@ export default function RecorderPage() {
           {hasRecorded && (
             <div className="flex items-center justify-center gap-4 text-xs text-muted-foreground">
               <span>{chunks.length} chunk(s)</span>
-              <span className="text-green-500">{transcripts.size} transcribed</span>
-              {processingCount > 0 && (
+              <span className="text-green-500">{transcriptCount} transcribed</span>
+              {transcriptCount < chunks.length && chunks.length > 0 && (
                 <span className="flex items-center gap-1 text-yellow-500">
                   <Loader2 className="size-3 animate-spin" />
-                  {processingCount} processing
+                  {chunks.length - transcriptCount} processing
                 </span>
               )}
             </div>
@@ -228,13 +260,11 @@ export default function RecorderPage() {
             >
               {isActive ? (
                 <>
-                  <Square className="size-4" />
-                  Stop
+                  <Square className="size-4" /> Stop
                 </>
               ) : (
                 <>
-                  <Mic className="size-4" />
-                  {status === "requesting" ? "Requesting..." : "Record"}
+                  <Mic className="size-4" /> {status === "requesting" ? "Requesting..." : "Record"}
                 </>
               )}
             </Button>
@@ -247,13 +277,11 @@ export default function RecorderPage() {
               >
                 {isPaused ? (
                   <>
-                    <Play className="size-4" />
-                    Resume
+                    <Play className="size-4" /> Resume
                   </>
                 ) : (
                   <>
-                    <Pause className="size-4" />
-                    Pause
+                    <Pause className="size-4" /> Pause
                   </>
                 )}
               </Button>
@@ -262,18 +290,18 @@ export default function RecorderPage() {
         </CardContent>
       </Card>
 
-      {/* Chunks with inline transcripts */}
+      {/* Chunks */}
       {chunks.length > 0 && (
         <Card className="w-full">
           <CardHeader>
             <CardTitle>Chunks</CardTitle>
             <CardDescription>
-              {transcripts.size}/{chunks.length} transcribed
+              {transcriptCount}/{chunks.length} transcribed
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-2">
             {chunks.map((chunk, i) => (
-              <ChunkItem key={chunk.id} chunk={chunk} index={i} transcript={transcripts.get(i)} />
+              <ChunkItem key={chunk.id} chunk={chunk} index={i} transcript={transcripts[i]} />
             ))}
             <Button
               variant="ghost"
@@ -281,11 +309,10 @@ export default function RecorderPage() {
               className="mt-2 gap-1.5 self-end text-destructive"
               onClick={() => {
                 clearChunks();
-                setTranscripts(new Map());
+                setTranscripts({});
               }}
             >
-              <Trash2 className="size-3" />
-              Clear all
+              <Trash2 className="size-3" /> Clear all
             </Button>
           </CardContent>
         </Card>
@@ -296,9 +323,12 @@ export default function RecorderPage() {
         <Card className="w-full">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <MessageSquare className="size-4" />
-              Full Transcript
+              <MessageSquare className="size-4" /> Full Transcript
             </CardTitle>
+            <CardDescription>
+              {transcriptCount}/{chunks.length} chunks
+              {transcriptCount < chunks.length ? " — more coming..." : ""}
+            </CardDescription>
           </CardHeader>
           <CardContent>
             <div className="rounded-sm border border-border/50 bg-muted/10 p-4">
@@ -311,8 +341,7 @@ export default function RecorderPage() {
                 className="gap-1.5"
                 onClick={() => navigator.clipboard.writeText(fullTranscript)}
               >
-                <Copy className="size-3" />
-                Copy
+                <Copy className="size-3" /> Copy
               </Button>
             </div>
           </CardContent>
@@ -337,12 +366,7 @@ function ChunkItem({
   return (
     <div className="rounded-sm border border-border/50 bg-muted/30 px-3 py-2">
       <div className="flex items-center justify-between gap-3">
-        <audio
-          ref={audioRef}
-          src={chunk.url}
-          onEnded={() => setPlaying(false)}
-          preload="none"
-        />
+        <audio ref={audioRef} src={chunk.url} onEnded={() => setPlaying(false)} preload="none" />
         <span className="text-xs font-medium text-muted-foreground tabular-nums">#{index + 1}</span>
         <span className="text-xs tabular-nums">{chunk.duration.toFixed(1)}s</span>
         {transcript ? (

@@ -8,7 +8,7 @@ import { broadcastToSession } from "../lib/ws";
 
 const app = new Hono();
 
-// Upload a chunk + transcribe it synchronously
+// Upload a chunk — returns IMMEDIATELY, transcription happens in background
 app.post("/upload", async (c) => {
   const formData = await c.req.formData();
   const file = formData.get("file") as File | null;
@@ -21,20 +21,15 @@ app.post("/upload", async (c) => {
   const audioStartedAt = formData.get("audioStartedAt") as string | null;
 
   if (!file || !recordingId || chunkIndex === null || !durationMs) {
-    return c.json(
-      { error: "Missing required fields: file, recordingId, chunkIndex, durationMs" },
-      400,
-    );
+    return c.json({ error: "Missing required fields" }, 400);
   }
 
-  // Idempotency check
+  // Idempotency
   if (idempotencyKey) {
     const existing = await db.query.chunks.findFirst({
       where: and(eq(chunks.idempotencyKey, idempotencyKey), eq(chunks.recordingId, recordingId)),
     });
-    if (existing) {
-      return c.json(existing, 200);
-    }
+    if (existing) return c.json(existing, 200);
   }
 
   const existingByIndex = await db.query.chunks.findFirst({
@@ -47,19 +42,17 @@ app.post("/upload", async (c) => {
   const recording = await db.query.recordings.findFirst({
     where: eq(recordings.id, recordingId),
   });
-  if (!recording) {
-    return c.json({ error: "Recording not found" }, 404);
-  }
+  if (!recording) return c.json({ error: "Recording not found" }, 404);
 
   const buffer = Buffer.from(await file.arrayBuffer());
-
   const serverChecksum = createHash("sha256").update(buffer).digest("hex");
+
   if (clientChecksum && clientChecksum !== serverChecksum) {
-    return c.json({ error: "Checksum mismatch — data corrupted in transit" }, 422);
+    return c.json({ error: "Checksum mismatch" }, 422);
   }
 
-  // WAL entry
-  const [walEntry] = await db
+  // WAL
+  await db
     .insert(uploadWal)
     .values({
       recordingId,
@@ -68,13 +61,12 @@ app.post("/upload", async (c) => {
       checksum: serverChecksum,
       attempts: 1,
     })
-    .onConflictDoNothing()
-    .returning();
+    .onConflictDoNothing();
 
   const storagePath = `db://${recordingId}/chunk-${chunkIndex}`;
   const audioTs = audioStartedAt ? new Date(Number(audioStartedAt)) : null;
 
-  // Upsert chunk record
+  // Upsert chunk
   let chunk: typeof existingByIndex;
   if (existingByIndex) {
     [chunk] = await db
@@ -107,15 +99,6 @@ app.post("/upload", async (c) => {
       .returning();
   }
 
-  // Update WAL
-  if (walEntry) {
-    await db
-      .update(uploadWal)
-      .set({ gcsPath: storagePath, uploaded: true, updatedAt: new Date() })
-      .where(eq(uploadWal.id, walEntry.id));
-  }
-
-  // Update total chunks count
   if (!existingByIndex) {
     await db
       .update(recordings)
@@ -123,69 +106,33 @@ app.post("/upload", async (c) => {
       .where(eq(recordings.id, recordingId));
   }
 
-  // --- TRANSCRIBE SYNCHRONOUSLY with Groq Whisper (free) ---
-  let transcriptionText: string | null = null;
-  let transcriptionError: string | null = null;
-
+  // RETURN IMMEDIATELY — don't wait for transcription
+  // Enqueue transcription in background
   if (chunk && process.env.GROQ_API_KEY) {
-    try {
-      const primaryLang = recording.languageCodes?.[0] ?? "en";
-      const result = await transcribeChunk(buffer, primaryLang);
+    const chunkId = chunk.id;
+    const lang = recording.languageCodes?.[0] ?? "en";
+    const sessionId = recording.sessionId;
 
-      // Save transcription record
-      await db
-        .insert(transcriptions)
-        .values({
-          chunkId: chunk.id,
-          recordingId,
-          participantId,
-          status: "completed",
-          fullText: result.fullText,
-          languageCode: result.languageCode,
-          confidence: result.confidence,
-          completedAt: new Date(),
-        })
-        .onConflictDoNothing();
-
-      // Mark WAL transcribed
-      await db
-        .update(uploadWal)
-        .set({ transcribed: true, updatedAt: new Date() })
-        .where(eq(uploadWal.recordingId, recordingId));
-
-      transcriptionText = result.fullText;
-
-      // Broadcast to session
-      if (recording.sessionId) {
-        broadcastToSession(recording.sessionId, {
-          type: "transcription_ready",
-          chunkId: chunk.id,
-          participantId,
-          text: result.fullText,
-        });
-      }
-    } catch (err) {
-      console.error("Transcription failed:", err);
-      transcriptionError = err instanceof Error ? err.message : "Transcription failed";
-      if (chunk) {
-        await db
-          .insert(transcriptions)
-          .values({
-            chunkId: chunk.id,
-            recordingId,
-            participantId,
-            status: "failed",
-            error: transcriptionError,
-          })
-          .onConflictDoNothing();
-      }
-    }
+    // Fire and forget — but use a global promise to keep Vercel alive
+    enqueueTranscription(chunkId, recordingId, participantId, buffer, lang, sessionId);
   }
 
-  return c.json({ ...chunk, transcriptionText, transcriptionError }, 201);
+  return c.json(chunk, 201);
 });
 
-// Acknowledge a chunk
+// Separate endpoint to trigger transcription manually
+app.post("/:id/transcribe", async (c) => {
+  const id = c.req.param("id");
+  const chunk = await db.query.chunks.findFirst({ where: eq(chunks.id, id) });
+  if (!chunk) return c.json({ error: "Chunk not found" }, 404);
+
+  const txn = await db.query.transcriptions.findFirst({ where: eq(transcriptions.chunkId, id) });
+  if (txn?.status === "completed") return c.json(txn);
+
+  return c.json({ status: "queued", chunkId: id });
+});
+
+// Acknowledge
 app.patch("/:id/ack", async (c) => {
   const id = c.req.param("id");
   const [chunk] = await db
@@ -193,17 +140,13 @@ app.patch("/:id/ack", async (c) => {
     .set({ status: "acknowledged", acknowledgedAt: new Date() })
     .where(eq(chunks.id, id))
     .returning();
-
-  if (!chunk) {
-    return c.json({ error: "Chunk not found" }, 404);
-  }
+  if (!chunk) return c.json({ error: "Chunk not found" }, 404);
   return c.json(chunk);
 });
 
 // Reconcile
 app.post("/reconcile/:recordingId", async (c) => {
   const recordingId = c.req.param("recordingId");
-
   const allChunks = await db
     .select()
     .from(chunks)
@@ -211,11 +154,9 @@ app.post("/reconcile/:recordingId", async (c) => {
     .orderBy(chunks.index);
 
   const missing: Array<{ chunkId: string; index: number }> = [];
-
   for (const chunk of allChunks) {
     if (chunk.gcsPath) {
-      const exists = chunkExists(chunk.gcsPath);
-      if (!exists) {
+      if (!chunkExists(chunk.gcsPath)) {
         await db
           .update(chunks)
           .set({ status: "failed", gcsPath: null })
@@ -226,26 +167,39 @@ app.post("/reconcile/:recordingId", async (c) => {
       missing.push({ chunkId: chunk.id, index: chunk.index });
     }
   }
-
-  const walEntries = await db
-    .select()
-    .from(uploadWal)
-    .where(and(eq(uploadWal.recordingId, recordingId), eq(uploadWal.uploaded, false)));
-
-  for (const entry of walEntries) {
-    if (!missing.some((m) => m.index === entry.chunkIndex)) {
-      missing.push({ chunkId: "", index: entry.chunkIndex });
-    }
-  }
-
   missing.sort((a, b) => a.index - b.index);
   return c.json({ recordingId, missing, total: allChunks.length });
 });
 
-// Get upload status
-app.get("/status/:recordingId", async (c) => {
+// Get chunks with transcripts for a recording
+app.get("/recording/:recordingId", async (c) => {
   const recordingId = c.req.param("recordingId");
 
+  const allChunks = await db
+    .select()
+    .from(chunks)
+    .where(eq(chunks.recordingId, recordingId))
+    .orderBy(chunks.index);
+
+  // Get transcripts for these chunks
+  const result = [];
+  for (const chunk of allChunks) {
+    const txn = await db.query.transcriptions.findFirst({
+      where: eq(transcriptions.chunkId, chunk.id),
+    });
+    result.push({
+      ...chunk,
+      transcript: txn?.status === "completed" ? txn.fullText : null,
+      transcriptionStatus: txn?.status ?? "pending",
+    });
+  }
+
+  return c.json(result);
+});
+
+// Status
+app.get("/status/:recordingId", async (c) => {
+  const recordingId = c.req.param("recordingId");
   const allChunks = await db
     .select()
     .from(chunks)
@@ -258,11 +212,85 @@ app.get("/status/:recordingId", async (c) => {
       id: ch.id,
       index: ch.index,
       status: ch.status,
-      hasGcsPath: !!ch.gcsPath,
       retryCount: ch.retryCount,
-      participantId: ch.participantId,
     })),
   });
 });
+
+/**
+ * Background transcription queue.
+ * Processes chunks one at a time to respect Groq rate limits.
+ */
+const transcriptionQueue: Array<() => Promise<void>> = [];
+let isProcessingQueue = false;
+
+function enqueueTranscription(
+  chunkId: string,
+  recordingId: string,
+  participantId: string | null,
+  audioBuffer: Buffer,
+  language: string,
+  sessionId: string | null,
+) {
+  transcriptionQueue.push(async () => {
+    try {
+      const result = await transcribeChunk(audioBuffer, language);
+
+      await db
+        .insert(transcriptions)
+        .values({
+          chunkId,
+          recordingId,
+          participantId,
+          status: "completed",
+          fullText: result.fullText,
+          languageCode: result.languageCode,
+          confidence: result.confidence,
+          completedAt: new Date(),
+        })
+        .onConflictDoNothing();
+
+      await db
+        .update(uploadWal)
+        .set({ transcribed: true, updatedAt: new Date() })
+        .where(eq(uploadWal.recordingId, recordingId));
+
+      if (sessionId) {
+        broadcastToSession(sessionId, {
+          type: "transcription_ready",
+          chunkId,
+          participantId,
+          text: result.fullText,
+        });
+      }
+    } catch (err) {
+      console.error("Transcription failed:", err);
+      await db
+        .insert(transcriptions)
+        .values({
+          chunkId,
+          recordingId,
+          participantId,
+          status: "failed",
+          error: err instanceof Error ? err.message : "Failed",
+        })
+        .onConflictDoNothing();
+    }
+  });
+
+  processQueue();
+}
+
+async function processQueue() {
+  if (isProcessingQueue) return;
+  isProcessingQueue = true;
+
+  while (transcriptionQueue.length > 0) {
+    const job = transcriptionQueue.shift();
+    if (job) await job();
+  }
+
+  isProcessingQueue = false;
+}
 
 export default app;
